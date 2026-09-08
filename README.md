@@ -1,7 +1,5 @@
 # Darkbloom warm-model manager
 
-Unreleased development build.
-
 Keeps one downloaded model warm on a running Darkbloom provider. The manager
 compares public network pressure and output prices, waits for a sustained score
 advantage, then switches when the provider is idle.
@@ -22,8 +20,9 @@ Tests use temporary files and fake network, daemon, and launch data. They do not
 need Darkbloom installed. CI runs on Linux with each supported Python version
 and on macOS with Python 3.14.
 
-Copy `warm_model_manager.py` to run it on another provider Mac. The filename
-stays the same across releases. Check your copy with
+Copy `warm_model_manager.py` to run it on another provider Mac, or download the
+[latest released script](https://github.com/benbuschmann/darkbloom-manager/releases/latest/download/warm_model_manager.py).
+The filename stays the same across releases. Check your copy with
 `python3 warm_model_manager.py --version`.
 
 ## Run
@@ -70,7 +69,8 @@ A live switch runs `darkbloom start` with one `--model` and
 sets `backend.preload_models` to a one-element list containing the selected
 model, preserving the rest of the config text. It waits until fresh daemon
 state confirms exactly that model is warm before starting the minimum warm
-time.
+time. A provider restart also starts a new minimum warm period, even if the
+manager's saved switch time is older.
 
 ## Timing and scores
 
@@ -185,13 +185,13 @@ write permissions.
 | Discovered model IDs, scan times, and scan errors | Show the last inventory when discovery fails. |
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
 | Candidate and consecutive-check counters | Continue confirmations across restarts. Live and dry-run counters are separate. |
-| Pending target and launch time | Wait for warm-up without issuing repeated restarts. |
+| Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
 | Last decision, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
 The manager does not collect prompts, responses, API keys,
-local request counts, or per-model request rates. Scan errors can contain local
-paths or CLI error text.
+local request counts, or per-model request rates. Discovery and launch errors
+can contain local paths or CLI error text.
 
 Use `--state /path/to/state.json` for another location. On the first run with
 the new default path, the manager copies the previous default state if present
@@ -226,7 +226,9 @@ Read `Reason`, `Challenger`, and `Deferred` in the report. The candidate may nee
 more consecutive checks, more warm time, or a larger score advantage. A busy,
 stopped, or stale provider also blocks a switch. Dry runs use the same gates.
 
-A load error or overdue warm-up blocks automatic retries. Inspect
+A failed or timed-out launch command, load error, or overdue warm-up blocks
+automatic retries. The pending target is saved before attempting the launch;
+fresh daemon state can still confirm success if the command timed out. Inspect
 `darkbloom status` and the provider logs, fix the loading problem, then stop the
 manager before editing pending state.
 
@@ -238,9 +240,21 @@ The manager runs in the foreground and installs no background service.
 
 ### How do I update an older installation?
 
-Stop the manager, run `git pull`, and use `warm_model_manager.py` in your launch
-command. For a copied installation, replace the script with the current file.
-The README commands and filenames do not depend on the release number.
+Stop the manager first. In a Git checkout, run `git pull` to get the latest
+source. For a standalone copy, run this in the folder containing your script
+to replace it with the latest public release:
+
+```sh
+curl -fL https://github.com/benbuschmann/darkbloom-manager/releases/latest/download/warm_model_manager.py \
+  -o warm_model_manager.py.new &&
+chmod +x warm_model_manager.py.new &&
+mv warm_model_manager.py.new warm_model_manager.py &&
+python3 warm_model_manager.py --version
+```
+
+Then use your existing launch command. Replacing the script leaves saved state
+intact. [Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
+are available on GitHub. The commands and filenames stay the same across releases.
 
 Remove old pairing and exploration flags, including `--no-pair` and
 `--no-exploration`. Those features are gone. Pending selections that contain

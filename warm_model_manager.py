@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "unreleased"
+MANAGER_VERSION = "0.1.0"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -555,6 +555,13 @@ def reconcile_pending_switch(
             f"warm-up confirmed after {format_duration(elapsed)}; starting minimum dwell",
         )
 
+    if pending.get("command_error"):
+        return Decision(
+            target,
+            f"switch attempt failed: {pending['command_error']}; automatic restart is blocked",
+            warming=True,
+        )
+
     if (
         daemon
         and daemon.load_error_model == target
@@ -936,10 +943,9 @@ def dwell_anchor(
     # separately prevents repeated restarts during a legitimate warm-up.
     if daemon is None or not daemon.warm_models:
         return 0.0
-    return float(
-        manager_state.get("last_switch_at")
-        or (daemon.started_at if daemon else 0)
-        or 0
+    return max(
+        float(manager_state.get("last_switch_at") or 0),
+        float(daemon.started_at or 0),
     )
 
 
@@ -977,7 +983,9 @@ def switch_forecast(
     if decision.target is None:
         return None
     if decision.warming:
-        return f"{display_name(decision.target)} is loading now"
+        # A pending command may have failed or timed out. Its reason explains
+        # the state; it does not provide a reliable loading ETA.
+        return None
 
     if current is None:
         if decision.target:
@@ -1422,16 +1430,22 @@ class Manager:
         elif not self.args.apply:
             log(f"dry run: would switch to {decision.target}")
         else:
-            # Keep the audit math and revoked old selections even if the
-            # subsequent CLI command fails before accepting a new switch.
-            write_json_atomic(self.state_path, manager_state)
-            log("switching the launchd provider to " + decision.target)
-            switch_model(self.args.darkbloom, decision.target, self.args.config, self.ignored)
+            # Persist intent before any provider change. A timed-out command
+            # can still have restarted Darkbloom, and must never be retried
+            # automatically just because it did not return successfully.
             manager_state["pending_switch"] = {
                 "target": decision.target,
                 "warm_models": [decision.target],
-                "command_at": now,
+                "command_at": time.time(),
             }
+            write_json_atomic(self.state_path, manager_state)
+            log("switching the launchd provider to " + decision.target)
+            try:
+                switch_model(self.args.darkbloom, decision.target, self.args.config, self.ignored)
+            except Exception as error:
+                manager_state["pending_switch"]["command_error"] = str(error)
+                write_json_atomic(self.state_path, manager_state)
+                raise
             log(f"switch command accepted: {decision.target}; waiting for warm confirmation")
 
         if selection_matches:

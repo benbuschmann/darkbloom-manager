@@ -30,16 +30,21 @@ and reported separately from offline test results.
 
 ## Releases
 
-The project is in cleanup toward its first 0.1 public release. Keep
-`MANAGER_VERSION = "unreleased"` and add changes under `Unreleased`. Do not
-create release tags or publish GitHub releases until the owner explicitly
-approves the public release. A cleanup commit or push does not authorize one.
+Between releases, keep `MANAGER_VERSION` at the last approved release number
+and add changes under `Unreleased`. Do not create release tags or publish
+GitHub releases until the owner explicitly approves the release. A cleanup
+commit or push does not authorize one.
 
 When approved, set the agreed release number, update its test, and add a dated
 changelog entry. Filenames and README commands stay independent of release
 numbers; state schemas change only when their data format changes. Before
 publishing, run the checks, inspect the staged files and outgoing commits, and
 verify the destination. Preserve Git history and do not force-push.
+
+Wait for CI to pass on the exact release commit. Attach the standalone
+`warm_model_manager.py` and its `SHA256SUMS` file to the release, then verify the
+published download against the tested source. Keep asset names independent of
+release numbers so the README's latest-release links continue to work.
 
 Never commit credentials, `.env`, private provider configuration or state,
 personal logs, model weights, benchmark output, or provider binaries. Use

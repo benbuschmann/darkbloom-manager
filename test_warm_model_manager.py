@@ -42,6 +42,7 @@ from warm_model_manager import (
     render_preload_model_config,
     revenue_scores,
     switch_model,
+    switch_block_reason,
     switch_forecast,
     track_current_residency,
     update_pressure_history,
@@ -62,8 +63,8 @@ def setUpModule() -> None:
 
 
 class CapacityTests(unittest.TestCase):
-    def test_manager_is_marked_unreleased(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "unreleased")
+    def test_manager_release_version(self) -> None:
+        self.assertEqual(MANAGER_VERSION, "0.1.0")
 
     def test_default_qwen_preference_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -394,6 +395,18 @@ class RuntimeForecastTests(unittest.TestCase):
             dwell_anchor({"last_switch_at": 1_950}, daemon),
             0.0,
         )
+
+    def test_new_daemon_start_preserves_dwell_after_an_older_saved_switch(self) -> None:
+        daemon = self.daemon(started_at=9_900)
+        state = {"last_switch_at": 1_000}
+        self.assertEqual(dwell_anchor(state, daemon), 9_900)
+        self.assertIn("1700 seconds remaining", switch_block_reason(
+            Decision("q36", "confirmed"), ["q36"], state, daemon, 10_000, 1_800,
+        ))
+        self.assertIsNone(switch_block_reason(
+            Decision("q36", "confirmed"), ["q36"], state, daemon, 11_700, 1_800,
+        ))
+        self.assertEqual(dwell_anchor({"last_switch_at": 10_100}, daemon), 10_100)
 
     def test_switch_eta_waits_for_confirmations_and_dwell(self) -> None:
         forecast = switch_forecast(
@@ -1037,7 +1050,59 @@ class ManagerIntegrationTests(unittest.TestCase):
             self.tick()
         state = json.loads(self.path.read_text())
         self.assertEqual(state["last_score_snapshot"]["models"][IGNORED]["score"], 75)
-        self.assertNotIn("pending_switch", state)
+        self.assertEqual(state["pending_switch"]["target"], "new")
+        self.assertEqual(state["pending_switch"]["command_error"], "launch refused")
+
+    def test_failed_or_timed_out_launch_is_not_repeated_after_restart(self) -> None:
+        errors = (RuntimeError("launch refused"), subprocess.TimeoutExpired(["darkbloom", "start"], 300))
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.path.unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.daemon.return_value = LocalDaemonState(None, (), False, 123, 100, True)
+
+                def fail_launch(*args):
+                    saved = json.loads(self.path.read_text())
+                    self.assertEqual(saved["pending_switch"]["target"], "good")
+                    raise error
+
+                self.launch.side_effect = fail_launch
+                with self.assertRaises(type(error)):
+                    self.tick()
+                self.manager = Manager(self.args)
+                for now in (10060, 10400):
+                    state, report = self.tick(now)
+                    self.assertEqual(state["pending_switch"]["command_error"], str(error))
+                    self.assertIn("automatic restart is blocked", report)
+                    self.assertNotIn("loading now", report)
+                self.launch.assert_called_once()
+
+                # A timed-out CLI may still have succeeded. Fresh warmth can
+                # confirm it without issuing another command.
+                self.daemon.return_value = LocalDaemonState("good", ("good",), False, 124, 10001, True)
+                state, report = self.tick(10460)
+                self.assertNotIn("pending_switch", state)
+                self.assertEqual(state["last_switch_at"], 10460)
+                self.assertIn("warm-up confirmed", report)
+                self.launch.assert_called_once()
+
+    def test_interrupted_launch_retains_pending_state_before_returning(self) -> None:
+        self.daemon.return_value = LocalDaemonState(None, (), False, 123, 100, True)
+        self.launch.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        self.manager = Manager(self.args)
+        state, report = self.tick(10060)
+        self.assertEqual(state["pending_switch"]["target"], "good")
+        self.assertIn("finish loading", report)
+        self.launch.assert_called_once()
+
+    def test_pending_state_write_failure_prevents_launch(self) -> None:
+        self.daemon.return_value = LocalDaemonState(None, (), False, 123, 100, True)
+        with patch("warm_model_manager.write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.tick()
+        self.launch.assert_not_called()
 
     def test_empty_inventory_without_ignore_flags_keeps_running(self) -> None:
         self.local.return_value = set()

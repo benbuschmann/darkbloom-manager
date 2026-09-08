@@ -8,8 +8,8 @@ release tooling. Do not maintain divergent copies in a parent workspace.
 
 - Keep runtime, test, and default state filenames free of release numbers.
   Keep state schema identifiers separate from `MANAGER_VERSION`.
-- This is cleanup work toward the first 0.1 public release. Keep
-  `MANAGER_VERSION = "unreleased"` and record changes under `Unreleased`.
+- Keep `MANAGER_VERSION` at the last approved release number between releases.
+  Record subsequent changes under `Unreleased` until the next release is approved.
 - Do not create release tags, publish GitHub releases, or assign a release
   number until the owner explicitly says the public release is ready. Requests
   to edit, test, commit, or push cleanup work are not release authorization.

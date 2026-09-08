@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-09-08
 
-Cleanup toward the first 0.1 public release. A release date has not been set.
+First public release.
 
 ### Current behavior
 
@@ -18,6 +18,11 @@ Cleanup toward the first 0.1 public release. A release date has not been set.
   preference weights. Show unavailable data and ignored raw-score leaders.
 - Apply switch costs, margins, consecutive checks, minimum warm time, and
   idle/fresh-daemon checks. Confirm warm-up before starting minimum warm time.
+- Save pending state before attempting a launch. Failed, timed-out, or
+  interrupted commands cannot trigger repeated launch attempts. Retain command
+  errors until fresh daemon state confirms the requested model is warm.
+- Respect minimum warm time after a provider restart even when saved state
+  contains an older switch time.
 - Synchronize the single startup preload before launching the selected model.
 - Use stable script, test, and state filenames. Keep the clearer timing flags
   and their older aliases. Copy previous state under the existing process locks.
@@ -27,5 +32,3 @@ Cleanup toward the first 0.1 public release. A release date has not been set.
 ### Removed during cleanup
 
 - Paired loading, exploration, and local request/rate observations.
-- Numbered development-release headings and release links from these notes.
-  The runtime identifies itself as `unreleased` until a public release is approved.
