@@ -144,6 +144,9 @@ models stay in the table, even when they are absent from the local list. Their
 rows show `IGNORED` alongside pressure, average, price, preference, and score.
 Their calculations are saved too.
 
+The `MODEL ID` column and decision lines use the exact IDs accepted by
+`--ignore-model`, including capitalization and any namespace prefix.
+
 `Highest raw score` includes ignored models and ties. It is measured before
 switch costs and thresholds. The `Decision`, `Challenger`, and `Deferred` lines
 show what the manager can actually do. A saved pending switch cannot authorize

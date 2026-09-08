@@ -48,12 +48,6 @@ DEFAULT_WEIGHTS = {
     "gemma-4-26b-qat-4bit": 1.05,
     "gpt-oss-20b": 1.00,
 }
-DISPLAY_NAMES = {
-    "qwen3.5-35b-a3b": "Qwen 3.5 35B A3B",
-    "qwen3.6-35b-a3b-vl-mtp-mxfp8": "Qwen 3.6 35B A3B VL",
-    "gemma-4-26b-qat-4bit": "Gemma 4 26B QAT",
-    "gpt-oss-20b": "GPT-OSS 20B",
-}
 DEFAULT_BASE_URL = os.environ.get(
     "DARKBLOOM_BASE_URL", "https://console.darkbloom.dev"
 ).rstrip("/")
@@ -829,9 +823,8 @@ def switch_model(
 
 
 def display_name(model: str | None) -> str:
-    if not model:
-        return "none"
-    return DISPLAY_NAMES.get(model, model)
+    """Keep the exact CLI model ID in every report line."""
+    return model or "none"
 
 
 def daemon_status_line(daemon: LocalDaemonState | None) -> str:
@@ -1087,7 +1080,7 @@ def print_report(
         )
     print("", flush=True)
     print(
-        f"{'MODEL':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} {'OUT$/M':>7} "
+        f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} {'OUT$/M':>7} "
         f"{'PROJ$/M':>8} {'PREF':>5} {'SCORE':>7} STATUS",
         flush=True,
     )

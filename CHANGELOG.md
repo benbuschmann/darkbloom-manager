@@ -6,6 +6,8 @@ Cleanup toward the first 0.1 public release. A release date has not been set.
 
 ### Current behavior
 
+- Show exact CLI model IDs in the table and decision lines so they can be
+  copied into `--ignore-model`.
 - Separate repeated terminal reports with a divider and leave a blank line
   between the model table and highest-score line.
 - Discover local downloads through `darkbloom models list --all --json` on
