@@ -1060,8 +1060,10 @@ def print_report(
         "%Y-%m-%d %H:%M:%S %Z"
     )
     mode = "LIVE — changes enabled" if apply else "DRY RUN — no changes enabled"
+    model_width = max([25, *(len(display_name(model)) + 2 for model in models)])
 
     print("", flush=True)
+    print("=" * (model_width + 63), flush=True)
     average_label = f"AVG {format_duration(interval_seconds * history_size)}"
     print(
         f"Darkbloom Warm Model Manager ({MANAGER_VERSION})  |  {timestamp}",
@@ -1084,7 +1086,6 @@ def print_report(
             flush=True,
         )
     print("", flush=True)
-    model_width = max([25, *(len(display_name(model)) + 2 for model in models)])
     print(
         f"{'MODEL':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} {'OUT$/M':>7} "
         f"{'PROJ$/M':>8} {'PREF':>5} {'SCORE':>7} STATUS",
@@ -1131,6 +1132,7 @@ def print_report(
             flush=True,
         )
     if scores:
+        print("", flush=True)
         highest = max(scores.values())
         leaders = [model for model in models if scores.get(model) == highest]
         names = [display_name(model) + (" [IGNORED]" if model in ignored_models else "") for model in leaders]

@@ -54,6 +54,9 @@ These settings check every minute, average up to five recent samples, require
 three consecutive checks that clear the switch thresholds, and keep a model
 warm for at least 30 minutes before replacing it.
 
+Each report starts with a separator. A blank line separates the model table
+from the highest-score line.
+
 Without `--apply`, the manager prints decisions and saves its own state. It
 does not launch a model or edit startup preloads. It still reads the local
 model list through Darkbloom, which may migrate an older provider config.

@@ -6,6 +6,8 @@ Cleanup toward the first 0.1 public release. A release date has not been set.
 
 ### Current behavior
 
+- Separate repeated terminal reports with a divider and leave a blank line
+  between the model table and highest-score line.
 - Discover local downloads through `darkbloom models list --all --json` on
   every check, using the selected provider config.
 - Load one model at a time. Ignored models stay visible with their calculations
