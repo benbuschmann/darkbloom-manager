@@ -64,7 +64,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.0")
+        self.assertEqual(MANAGER_VERSION, "0.1.1")
 
     def test_default_qwen_preference_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-09-08
 
 - Use minimum warm time and consecutive passing checks in terminal messages,
   with the relevant timing flags beside wait and progress messages. Rename

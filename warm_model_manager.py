@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.0"
+MANAGER_VERSION = "0.1.1"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
