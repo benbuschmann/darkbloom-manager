@@ -1,0 +1,259 @@
+# Darkbloom warm-model manager
+
+Unreleased development build.
+
+Keeps one downloaded model warm on a running Darkbloom provider. The manager
+compares public network pressure and output prices, waits for a sustained score
+advantage, then switches when the provider is idle.
+
+## Install
+
+You need an Apple Silicon Mac with a configured Darkbloom provider, downloaded
+models, and Python 3.10–3.14. The script uses Python's standard library. It needs
+no API key or extra packages.
+
+```sh
+git clone https://github.com/benbuschmann/darkbloom-manager.git
+cd darkbloom-manager
+python3 -m unittest discover -s . -p 'test_*.py'
+```
+
+Tests use temporary files and fake network, daemon, and launch data. They do not
+need Darkbloom installed. CI runs on Linux with each supported Python version
+and on macOS with Python 3.14.
+
+Copy `warm_model_manager.py` to run it on another provider Mac. The filename
+stays the same across releases. Check your copy with
+`python3 warm_model_manager.py --version`.
+
+## Run
+
+Preview one check:
+
+```sh
+python3 warm_model_manager.py once \
+  --check-every 60 \
+  --average-samples 5 \
+  --switch-after-checks 3 \
+  --min-warm-time 1800 \
+  --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
+```
+
+For continuous loading:
+
+```sh
+python3 warm_model_manager.py run --apply \
+  --check-every 60 \
+  --average-samples 5 \
+  --switch-after-checks 3 \
+  --min-warm-time 1800 \
+  --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
+```
+
+These settings check every minute, average up to five recent samples, require
+three consecutive checks that clear the switch thresholds, and keep a model
+warm for at least 30 minutes before replacing it.
+
+Without `--apply`, the manager prints decisions and saves its own state. It
+does not launch a model or edit startup preloads. It still reads the local
+model list through Darkbloom, which may migrate an older provider config.
+
+Add `--config /path/to/provider.toml` if your provider uses a custom config.
+Discovery and live launches both use that path. Use
+`--darkbloom /path/to/darkbloom` if the CLI is not on your `PATH`.
+
+A live switch runs `darkbloom start` with one `--model` and
+`--idle-timeout 0`. That restarts the provider. Before launching, the manager
+sets `backend.preload_models` to a one-element list containing the selected
+model, preserving the rest of the config text. It waits until fresh daemon
+state confirms exactly that model is warm before starting the minimum warm
+time.
+
+## Timing and scores
+
+| Flag | Default | What it controls |
+| --- | --- | --- |
+| `--check-every SECONDS` | 900 | Seconds between checks. Minimum: 60. |
+| `--average-samples COUNT` | 3 | Maximum number of recent pressure samples to average. |
+| `--switch-after-checks COUNT` | 2 | Consecutive checks the same candidate must pass before switching. |
+| `--min-warm-time SECONDS` | 2700 | Minimum time to keep a warm model before replacing it. |
+
+The old names still work as aliases: `--interval`, `--history`,
+`--confirmations`, and `--min-dwell`, respectively.
+
+Samples expire after `check-every × average-samples` seconds, including while
+the manager is stopped. With `60` and `5`, the average contains at most five
+samples from the past five minutes. The table's `N` column shows how many are
+available. Changing either setting clears the old samples and confirmation
+counters.
+
+```text
+pressure = active requests / max(1, warm providers)
+projected value = average pressure × output price per million tokens
+score = projected value × preference weight
+```
+
+The score assumes equal output speed across models. It does not measure your
+provider's payout or throughput.
+
+| Model ID | Default weight |
+| --- | ---: |
+| `qwen3.5-35b-a3b` | 1.25 |
+| `qwen3.6-35b-a3b-vl-mtp-mxfp8` | 1.20 |
+| `gemma-4-26b-qat-4bit` | 1.05 |
+| `gpt-oss-20b` | 1.00 |
+| Other models | 1.00 |
+
+Set a preference with `--weight MODEL_ID=WEIGHT`. Repeat it for more models.
+Weights must be positive; they can also name ignored models or future downloads.
+
+Before comparing a candidate with the current model, the manager discounts its
+score by `(decision-horizon − switch-cost) / decision-horizon`. It then checks
+both margins. With the defaults, a current score of `0.10` and a candidate score
+of `0.12` produce an adjusted candidate score of `0.11`. That misses the required
+`0.125`, so no switch confirmation is counted.
+
+| Flag | Default | What it controls |
+| --- | --- | --- |
+| `--relative-margin` | 0.25 | Required score advantage after the discount: 25%. |
+| `--absolute-margin` | 0.01 | Required score increase, also after the discount. |
+| `--switch-cost` | 300 seconds | Estimated time lost while changing models. |
+| `--decision-horizon` | 3600 seconds | Period used to weigh that lost time. Must exceed switch cost. |
+| `--warmup-timeout` | 180 seconds | Loading grace before an unconfirmed launch is reported as overdue. |
+| `--pricing-refresh` | 900 seconds | Time between price-cache refreshes. |
+
+If no eligible model is currently warm, the manager selects the highest scored
+eligible model without waiting for confirmations. It still checks daemon
+health, active requests, and pending warm-up. An empty warm list has no minimum
+warm time to preserve; an existing warm selection does.
+
+## Discovery and ignored models
+
+Every check runs `darkbloom models list --all --json`. Downloads and removals
+appear on the next check. Repeated `--model MODEL_ID` flags restrict the
+candidates and set their tie order. Each launch still requests one model.
+Without that restriction, the four weighted models above retain their tie
+order, followed by other IDs alphabetically.
+
+Use `--ignore-model MODEL_ID`, or `--ignore MODEL_ID`, to exclude a model from
+loading. The flag is repeatable and matches exact, case-sensitive IDs. Ignored
+models stay in the table, even when they are absent from the local list. Their
+rows show `IGNORED` alongside pressure, average, price, preference, and score.
+Their calculations are saved too.
+
+`Highest raw score` includes ignored models and ties. It is measured before
+switch costs and thresholds. The `Decision`, `Challenger`, and `Deferred` lines
+show what the manager can actually do. A saved pending switch cannot authorize
+an ignored model to load.
+
+Darkbloom's `--all` bypasses the enabled-model config filter, but its scanner can
+still omit downloads that exceed available memory. Listing also skips the
+serving command's runtime-capability filter. A listed model can therefore fail
+to run on your GPU. Explicit ignore IDs keep those models available for scoring.
+
+This behavior was checked on September 8, 2026 against the upstream
+[list command](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/darkbloom/ModelsCommand.swift),
+[runtime filtering](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/darkbloom/Darkbloom.swift),
+and [model scanner](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/ProviderCore/Models/ModelScanner%2BDiscovery.swift).
+
+## FAQ
+
+### Do I need a Darkbloom API key?
+
+No. The manager reads public capacity and pricing endpoints without an API key.
+It uses your installed Darkbloom CLI and provider config for local operations.
+It does not read a `.env` file. Darkbloom itself must already be configured and
+running; follow its [provider setup instructions](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/installation.md).
+
+### What is saved locally?
+
+The manager writes `~/.darkbloom/warm-model-manager-state.json` after each check,
+including dry runs. The file is replaced atomically and has owner-only read and
+write permissions.
+
+| Saved data | Purpose |
+| --- | --- |
+| Timestamped pressure samples | Rebuild each model's rolling average after a restart. |
+| Latest score snapshot | Retain pressure, average, price, weight, score, and ignore/eligibility status. |
+| Price cache and fetch time | Reuse prices between refreshes and identify stale prices. |
+| Discovered model IDs, scan times, and scan errors | Show the last inventory when discovery fails. |
+| Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
+| Candidate and consecutive-check counters | Continue confirmations across restarts. Live and dry-run counters are separate. |
+| Pending target and launch time | Wait for warm-up without issuing repeated restarts. |
+| Last decision, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
+
+Each save replaces the latest snapshot and keeps a bounded sample window.
+The manager does not collect prompts, responses, API keys,
+local request counts, or per-model request rates. Scan errors can contain local
+paths or CLI error text.
+
+Use `--state /path/to/state.json` for another location. On the first run with
+the new default path, the manager copies the previous default state if present
+and leaves the original file in place. It holds the older managers' locks
+before copying. An existing new state file wins; custom state paths are not
+migrated. A release-number change does not reset state.
+
+The saved ignore list records the last run's settings. Keep `--ignore-model`
+in your launch command; saved settings do not replace command-line options.
+
+### Can I delete the state file?
+
+Stop the manager first. Deleting state removes rolling samples, confirmation
+progress, and pending warm-up tracking. For a deliberate fresh start, use a
+new `--state` path after stopping the old process. Deleting the default file
+can cause the retained previous state to be imported again.
+
+### What happens when data is unavailable?
+
+Missing pressure or price appears as `N/A`. Recent averages remain visible
+until they expire, but missing current pressure prevents a fresh score. A price
+refresh failure can use the last cache, labeled with its fetch time. Models
+without an explicit price use Darkbloom's public fallback price when available.
+Without any usable price, a model is excluded from selection.
+
+If local discovery fails, the last inventory remains visible and new launches
+are blocked.
+
+### Why hasn't it switched?
+
+Read `Reason`, `Challenger`, and `Deferred` in the report. The candidate may need
+more consecutive checks, more warm time, or a larger score advantage. A busy,
+stopped, or stale provider also blocks a switch. Dry runs use the same gates.
+
+A load error or overdue warm-up blocks automatic retries. Inspect
+`darkbloom status` and the provider logs, fix the loading problem, then stop the
+manager before editing pending state.
+
+### What does Ctrl-C stop?
+
+It stops the manager after any in-flight check or command finishes. The
+provider keeps its last model, startup preload, and always-warm idle setting.
+The manager runs in the foreground and installs no background service.
+
+### How do I update an older installation?
+
+Stop the manager, run `git pull`, and use `warm_model_manager.py` in your launch
+command. For a copied installation, replace the script with the current file.
+The README commands and filenames do not depend on the release number.
+
+Remove old pairing and exploration flags, including `--no-pair` and
+`--no-exploration`. Those features are gone. Pending selections that contain
+multiple models are discarded. Only one model can satisfy warm-up.
+
+Run one manager per provider. The lock prevents overlapping old and new
+processes; do not delete a lock file while a manager is running.
+
+## Files and support
+
+Darkbloom's daemon state defaults to `~/.darkbloom/daemon-state.json`. Override
+it with `--daemon-state` or `DARKBLOOM_STATE_FILE`. The provider config defaults
+to `~/.config/darkbloom/provider.toml`.
+
+Report bugs in [GitHub issues](https://github.com/benbuschmann/darkbloom-manager/issues)
+with the manager, Darkbloom, Python, and macOS versions, your chip and RAM, model
+IDs, a redacted command, and the relevant report lines. Leave out tokens and
+private config files. Development checks are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+This project's code and documentation use the [MIT license](LICENSE).
+Darkbloom is installed separately and has its own
+[license](https://github.com/Layr-Labs/d-inference/blob/master/LICENSE).
