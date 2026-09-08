@@ -22,6 +22,7 @@ from warm_model_manager import (
     build_score_snapshot,
     build_parser,
     cached_output_prices,
+    catalog_model_ids,
     challenger_state_keys,
     choose_scored_target,
     current_warm_model,
@@ -64,7 +65,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.1")
+        self.assertEqual(MANAGER_VERSION, "0.1.2")
 
     def test_default_qwen_preference_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -643,6 +644,33 @@ class SingleModelLoadingTests(unittest.TestCase):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_catalog_uses_official_array_and_selected_config(self) -> None:
+        rows = [{"id": "Qwen3.5-9B", "min_ram_gb": 16}, {"id": IGNORED}, {"id": "Qwen3.5-9B"}]
+        with patch("warm_model_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+            self.assertEqual(catalog_model_ids("custom-darkbloom", Path("custom.toml")), {"Qwen3.5-9B", IGNORED})
+            self.assertEqual(run.call_args.args[0], [
+                "custom-darkbloom", "models", "catalog", "--config", "custom.toml", "--json",
+            ])
+
+    def test_empty_catalog_is_valid_but_partial_or_malformed_catalog_is_not(self) -> None:
+        with patch("warm_model_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "[]", "")
+            self.assertEqual(catalog_model_ids("darkbloom"), set())
+            for payload in ({}, [{"id": "good"}, {}], [{"id": 1}], [{"id": " "}]):
+                with self.subTest(payload=payload):
+                    run.return_value = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+                    with self.assertRaisesRegex(RuntimeError, "catalog models JSON"):
+                        catalog_model_ids("darkbloom")
+
+    def test_catalog_failure_and_update_banner(self) -> None:
+        with patch("warm_model_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, "", "coordinator unavailable")
+            with self.assertRaisesRegex(RuntimeError, "catalog models: coordinator unavailable"):
+                catalog_model_ids("darkbloom")
+            run.return_value = subprocess.CompletedProcess([], 0, '[update] Available\n[{"id":"good"}]\n', "")
+            self.assertEqual(catalog_model_ids("darkbloom"), {"good"})
+
     def test_official_json_shape_and_config_are_used(self) -> None:
         payload = {"cacheDirectory": "/cache", "filteredByConfig": False,
                    "models": [{"id": "new"}, {"id": IGNORED}, {"id": "new"}]}
@@ -808,6 +836,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         ])
         self.manager = Manager(self.args)
         self.local = self.mock("local_model_ids", return_value={"good", IGNORED})
+        self.catalog = self.mock("catalog_model_ids", return_value=set())
         self.capacity = self.mock("fetch_capacity", return_value=self.samples(good=1, **{IGNORED: 100}))
         self.prices = self.mock("fetch_output_prices", return_value=({"good": 0.5, IGNORED: 0.75}, 0.2))
         self.daemon = self.mock("read_daemon_state", return_value=LocalDaemonState(
@@ -853,6 +882,187 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(state["last_decision_target"], "good")
         self.assertIn(f"Highest raw score: {IGNORED} [IGNORED]", report)
         self.assertNotIn("WOULD SWITCH", report)
+        self.launch.assert_not_called()
+
+    def test_catalog_models_without_downloads_are_scored_but_never_selected(self) -> None:
+        remote = "Qwen3.5-9B"
+        self.catalog.return_value = {"good", remote, "catalog-only"}
+        self.local.return_value = {"good"}
+        self.capacity.return_value = self.samples(good=1, **{remote: 1000})
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.path.unlink(missing_ok=True)
+                self.args.apply = apply
+                self.manager = Manager(self.args)
+                state, report = self.tick()
+                row = state["last_score_snapshot"]["models"][remote]
+                self.assertEqual(row["now_pressure"], 1000)
+                self.assertEqual(row["average_pressure"], 1000)
+                self.assertEqual(row["score"], 200)
+                self.assertEqual(row["preference"], 1)
+                self.assertFalse(row["ignored"])
+                self.assertTrue(row["auto_ignored"])
+                self.assertFalse(row["local_available"])
+                self.assertFalse(row["eligible"])
+                self.assertIn("AUTO-IGNORED; not downloaded or filtered out", report)
+                self.assertIn(f"Highest raw score: {remote} [AUTO-IGNORED]", report)
+                missing = state["last_score_snapshot"]["models"]["catalog-only"]
+                self.assertIsNone(missing["score"])
+                self.assertIsNone(missing["now_pressure"])
+                self.assertIn("capacity unavailable", missing["status"])
+                self.assertEqual(state["last_decision_target"], "good")
+                self.assertNotIn("WOULD SWITCH", report)
+                self.assertNotIn("pending_switch", state)
+                self.launch.assert_not_called()
+
+    def test_download_becomes_eligible_then_removal_revokes_pending_selection(self) -> None:
+        remote = "Qwen3.5-9B"
+        self.local.return_value = {"good"}
+        self.catalog.return_value = {"good", remote, IGNORED}
+        self.capacity.return_value = self.samples(good=1, **{remote: 100, IGNORED: 1000})
+        state, _ = self.tick()
+        self.assertTrue(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
+        self.local.return_value = {"good", remote, IGNORED}
+        for index in range(1, 4):
+            state, _ = self.tick(10000 + index * 60)
+            self.assertFalse(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
+            self.assertTrue(state["last_score_snapshot"]["models"][remote]["eligible"])
+            self.assertTrue(state["last_score_snapshot"]["models"][IGNORED]["ignored"])
+            if index < 3:
+                self.assertEqual(state["live_challenger_streak"], index)
+                self.launch.assert_not_called()
+        self.launch.assert_called_once_with("darkbloom", remote, None, {IGNORED})
+        self.assertEqual(state["pending_switch"]["target"], remote)
+        self.local.return_value = {"good", IGNORED}
+        state, report = self.tick(10240)
+        self.assertNotIn("pending_switch", state)
+        self.assertEqual(state["last_decision_target"], "good")
+        self.assertTrue(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
+        self.assertEqual(len(state["pressure_history"][remote]), 5)
+        self.assertIn("discarded pending switch", report)
+        self.launch.assert_called_once()
+
+    def test_model_flag_restricts_loading_without_hiding_catalog_rows(self) -> None:
+        self.catalog.return_value = {"first", "second", "excluded"}
+        self.local.return_value = set(self.catalog.return_value)
+        self.capacity.return_value = self.samples(first=1, second=1, excluded=1000)
+        self.daemon.return_value = LocalDaemonState(None, (), False, 123, 100, True)
+        self.args.model = ["second", "first"]
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.path.unlink(missing_ok=True)
+                self.args.apply = apply
+                self.manager = Manager(self.args)
+                state, report = self.tick()
+                self.assertEqual(state["last_decision_target"], "second")
+                row = state["last_score_snapshot"]["models"]["excluded"]
+                self.assertTrue(row["local_available"])
+                self.assertTrue(row["excluded_by_model_flag"])
+                self.assertTrue(row["auto_ignored"])
+                self.assertIn("AUTO-IGNORED; outside --model selection", report)
+                if not apply:
+                    self.launch.assert_not_called()
+        self.launch.assert_called_once_with("darkbloom", "second", None, {IGNORED})
+
+    def test_catalog_refresh_does_not_reset_passing_checks_for_local_candidates(self) -> None:
+        self.catalog.return_value = {"good", "candidate"}
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=100)
+        state, _ = self.tick()
+        self.assertEqual(state["live_challenger_streak"], 1)
+        self.catalog.return_value.add("new-remote")
+        state, _ = self.tick(10060)
+        self.assertEqual(state["live_challenger_streak"], 2)
+        self.assertIn("new-remote", state["last_score_snapshot"]["models"])
+        self.launch.assert_not_called()
+
+    def test_catalog_outage_retains_rows_across_restart_without_fresh_scores(self) -> None:
+        self.catalog.return_value = {"good", "remote"}
+        self.capacity.return_value = self.samples(good=1, remote=10)
+        self.tick()
+        self.catalog.side_effect = RuntimeError("catalog offline")
+        self.capacity.side_effect = RuntimeError("capacity offline")
+        self.manager = Manager(self.args)
+        state, report = self.tick(10060)
+        self.assertEqual(state["catalog"]["status"], "stale cache")
+        self.assertEqual(state["catalog"]["fetched_at"], 10000)
+        row = state["last_score_snapshot"]["models"]["remote"]
+        self.assertEqual(row["average_pressure"], 10)
+        self.assertIsNone(row["score"])
+        self.assertIn("Catalog:   stale cache", report)
+        self.assertIn("capacity unavailable; AVG retained", row["status"])
+        self.catalog.side_effect = None
+        self.catalog.return_value = {"good", "replacement"}
+        state, _ = self.tick(10120)
+        self.assertNotIn("remote", self.manager.models)
+        self.assertIn("replacement", self.manager.models)
+        self.assertEqual(state["catalog"]["status"], "live")
+        self.launch.assert_not_called()
+
+    def test_catalog_failure_uses_live_capacity_ids_for_visibility(self) -> None:
+        self.catalog.side_effect = RuntimeError("catalog unavailable")
+        self.local.return_value = {"good"}
+        self.capacity.return_value = self.samples(good=1, **{"network-only": 1000})
+        state, report = self.tick()
+        self.assertEqual(state["catalog"]["status"], "unavailable")
+        self.assertTrue(state["last_score_snapshot"]["models"]["network-only"]["auto_ignored"])
+        self.assertIn("Catalog:   unavailable", report)
+        self.assertEqual(state["last_decision_target"], "good")
+        self.launch.assert_not_called()
+
+    def test_local_scan_failure_shows_unknown_presence_and_blocks_loading(self) -> None:
+        self.catalog.return_value = {"good", "remote"}
+        self.capacity.return_value = self.samples(good=1, remote=100)
+        self.tick()
+        self.local.side_effect = RuntimeError("local scan failed")
+        state, report = self.tick(10060)
+        for model in ("good", "remote"):
+            row = state["last_score_snapshot"]["models"][model]
+            self.assertIsNone(row["local_available"])
+            self.assertTrue(row["auto_ignored"])
+            self.assertIn("local scan unavailable", row["status"])
+        self.assertNotIn("not downloaded or filtered out", report)
+        self.assertIsNone(state["last_decision_target"])
+        self.launch.assert_not_called()
+
+    def test_catalog_cache_does_not_cross_config_paths(self) -> None:
+        self.catalog.return_value = {"catalog-only"}
+        self.tick()
+        self.args.config = Path("other-provider.toml")
+        self.catalog.side_effect = RuntimeError("offline")
+        state, _ = self.tick(10060)
+        self.assertEqual(state["catalog"]["status"], "unavailable")
+        self.assertEqual(state["catalog"]["models"], [])
+        self.assertNotIn("catalog-only", self.manager.models)
+        self.catalog.assert_called_with("darkbloom", Path("other-provider.toml"))
+
+    def test_slow_catalog_cannot_make_an_old_daemon_snapshot_look_fresh(self) -> None:
+        self.args.daemon_state = self.path.with_name("daemon.json")
+        self.args.daemon_state.write_text(json.dumps({
+            "pid": 123, "started_at": 100, "written_at": 10000,
+            "warm_models": [], "inference_active": False,
+        }))
+        self.daemon.side_effect = read_daemon_state
+
+        def slow_catalog(*args):
+            self.clock.return_value = 10120
+            return {"good"}
+
+        self.catalog.side_effect = slow_catalog
+        with patch("warm_model_manager.process_alive", return_value=True):
+            _, report = self.tick()
+        self.assertIn("STALE", report)
+        self.assertIn("DEFERRED", report)
+        self.launch.assert_not_called()
+
+    def test_empty_catalog_local_inventory_and_network_feed_keep_running(self) -> None:
+        self.local.return_value = set()
+        self.capacity.side_effect = RuntimeError("offline")
+        self.args.ignore_model = []
+        self.manager = Manager(self.args)
+        state, report = self.tick()
+        self.assertEqual(state["last_score_snapshot"]["models"], {})
+        self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 
     def test_filtered_ignored_id_is_still_scored_and_shown(self) -> None:
@@ -1104,12 +1314,13 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.tick()
         self.launch.assert_not_called()
 
-    def test_empty_inventory_without_ignore_flags_keeps_running(self) -> None:
+    def test_empty_local_inventory_keeps_network_models_visible_without_ignore_flags(self) -> None:
         self.local.return_value = set()
         self.args.ignore_model = []
         self.manager = Manager(self.args)
         state, report = self.tick()
-        self.assertEqual(state["last_score_snapshot"]["models"], {})
+        self.assertEqual(set(state["last_score_snapshot"]["models"]), {"good", IGNORED})
+        self.assertTrue(all(row["auto_ignored"] for row in state["last_score_snapshot"]["models"].values()))
         self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 

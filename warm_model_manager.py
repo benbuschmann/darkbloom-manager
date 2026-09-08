@@ -7,9 +7,9 @@ speed, pressure multiplied by output USD per million tokens is a projected
 revenue-rate proxy.  Small preference weights remain a deliberate operator
 bias, not a claimed component of revenue.
 
-Every selection requests exactly one warm model. Local models are rediscovered
-every check, and each model is scored independently.
-Explicitly ignored models remain visible for comparison but cannot be loaded.
+Every selection requests exactly one warm model. The catalog, network capacity,
+and local scan supply the model table. Models absent from the local scan are
+automatically ignored; explicit ignores also remain visible for comparison.
 
 The file is intentionally standalone: copy only this script to a Mac running
 Darkbloom.  It uses Python's standard library, the installed ``darkbloom``
@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.1"
+MANAGER_VERSION = "0.1.2"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -67,7 +67,7 @@ DEFAULT_DAEMON_STATE_PATH = Path(
 # Only retain state used by this release. Removed features cannot leave stale
 # instructions behind or keep accumulating private runtime observations.
 MANAGER_STATE_KEYS = {
-    "active_target", "current_model", "current_residency", "discovery",
+    "active_target", "current_model", "current_residency", "discovery", "catalog",
     "last_decision_at", "last_decision_reason", "last_decision_target",
     "last_score_snapshot", "last_switch_at", "manager_version",
     "pending_switch", "preload_sync_schema", "pressure_cadence", "pressure_history",
@@ -322,11 +322,34 @@ def build_score_snapshot(
     window_seconds: float,
     ignored_models: Iterable[str] = (),
     eligible_models: Iterable[str] = (),
+    local_models: set[str] | None = None,
+    selected_models: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the persisted audit record for the values driving a decision."""
     model_values: dict[str, dict[str, Any]] = {}
     for model in models:
         sample = samples.get(model)
+        locally_available = model in local_models if local_models is not None else None
+        excluded_by_model_flag = selected_models is not None and model not in selected_models
+        ignored = model in ignored_models
+        auto_ignored = not ignored and (locally_available is not True or excluded_by_model_flag)
+        status = []
+        if ignored:
+            status.append("IGNORED")
+        elif auto_ignored:
+            status.append("AUTO-IGNORED")
+        elif model not in eligible_models:
+            status.append("INELIGIBLE")
+        if locally_available is None:
+            status.append("local scan unavailable")
+        elif not locally_available:
+            status.append("not downloaded or filtered out")
+        if excluded_by_model_flag:
+            status.append("outside --model selection")
+        if sample is None:
+            status.append("capacity unavailable; AVG retained" if history.get(model) else "capacity unavailable")
+        if model not in output_prices:
+            status.append("price unavailable")
         projected = (
             averages[model] * output_prices[model]
             if sample is not None and model in averages and model in output_prices
@@ -341,7 +364,11 @@ def build_score_snapshot(
             "projected_usd_per_million": projected,
             "preference": weights.get(model, 1.0),
             "score": scores.get(model),
-            "ignored": model in ignored_models,
+            "ignored": ignored,
+            "auto_ignored": auto_ignored,
+            "local_available": locally_available,
+            "excluded_by_model_flag": excluded_by_model_flag,
+            "status": status,
             "eligible": model in eligible_models,
         }
     return {
@@ -612,6 +639,20 @@ def local_model_ids(darkbloom: str, config_path: Path | None = None) -> set[str]
     if config_path:
         command.extend(["--config", str(config_path)])
     command.extend(["--all", "--json"])
+    return command_model_ids(command, "local")
+
+
+def catalog_model_ids(darkbloom: str, config_path: Path | None = None) -> set[str]:
+    """Read concrete catalog IDs from the configured coordinator, without aliases."""
+    command = [darkbloom, "models", "catalog"]
+    if config_path:
+        command.extend(["--config", str(config_path)])
+    command.append("--json")
+    return command_model_ids(command, "catalog")
+
+
+def command_model_ids(command: list[str], source: str) -> set[str]:
+    """Accept the CLI's local object or catalog array, never partial inventories."""
     result = subprocess.run(
         command,
         capture_output=True,
@@ -621,7 +662,7 @@ def local_model_ids(darkbloom: str, config_path: Path | None = None) -> set[str]
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-        raise RuntimeError(f"could not list local models: {detail}")
+        raise RuntimeError(f"could not list {source} models: {detail}")
     payload = parse_json_output(result.stdout)
     records = payload.get("models") if isinstance(payload, dict) else payload
     if not isinstance(records, list) or any(
@@ -630,8 +671,13 @@ def local_model_ids(darkbloom: str, config_path: Path | None = None) -> set[str]
         or not model["id"].strip()
         for model in records
     ):
-        raise RuntimeError("unexpected local models JSON; expected a models array with string ids")
+        raise RuntimeError(f"unexpected {source} models JSON; expected a models array with string ids")
     return {model["id"] for model in records}
+
+
+def ordered_model_ids(models: Iterable[str]) -> list[str]:
+    priority = {model: index for index, model in enumerate(DEFAULT_WEIGHTS)}
+    return sorted(set(models), key=lambda model: (priority.get(model, len(priority)), model))
 
 
 def eligible_local_targets(
@@ -1073,7 +1119,16 @@ def print_report(
     print(f"Mode:      {mode}", flush=True)
     print(f"Darkbloom: {daemon_status_line(daemon)}", flush=True)
     discovery = manager_state.get("discovery") or {}
-    print(f"Discovery: {discovery.get('status', 'unknown')} (refreshed every check)", flush=True)
+    print(f"Discovery: {discovery.get('status', 'unknown')} (local scan; refreshed every check)", flush=True)
+    catalog = manager_state.get("catalog") or {}
+    catalog_at = catalog.get("fetched_at")
+    catalog_age = f"; fetched {format_local_time(catalog_at, now)}" if catalog_at else ""
+    catalog_count = len(catalog.get("models") or [])
+    catalog_detail = (
+        f"{catalog_count} model{'s' if catalog_count != 1 else ''}"
+        if catalog.get("status") in {"live", "stale cache"} else "no cached catalog"
+    )
+    print(f"Catalog:   {catalog.get('status', 'unavailable')}; {catalog_detail}{catalog_age}", flush=True)
     pricing = manager_state.get("pricing_status") or {}
     fetched_at = pricing.get("fetched_at")
     price_age = f"; fetched {format_local_time(fetched_at, now)}" if fetched_at else ""
@@ -1096,6 +1151,7 @@ def print_report(
     def number(value: float | None) -> str:
         return f"{value:.3f}" if value is not None else "N/A"
 
+    snapshot_models = (manager_state.get("last_score_snapshot") or {}).get("models", {})
     for model in models:
         sample = samples.get(model)
         marker = (
@@ -1111,19 +1167,7 @@ def print_report(
             averages[model] * output_prices[model] if model in scores else None
         )
         sample_count = len(pressure_history.get(model, []))
-        status = []
-        if model in ignored_models:
-            status.append("IGNORED")
-        elif model not in eligible_models:
-            status.append("INELIGIBLE")
-        if sample is None:
-            status.append("capacity unavailable; AVG retained" if sample_count else "capacity unavailable")
-        if model not in output_prices:
-            status.append("price unavailable")
-        if discovery.get("status") == "live" and model not in discovery.get("models", []):
-            status.append("not in local list")
-        elif model not in eligible_models and model in samples and model in output_prices and model not in ignored_models:
-            status.append("local eligibility unavailable")
+        status = snapshot_models.get(model, {}).get("status", [])
         print(
             f"{label:<{model_width}} {number(sample.pressure if sample else None):>6} "
             f"{number(averages.get(model)):>8} {sample_count:>3} "
@@ -1136,10 +1180,13 @@ def print_report(
         print("", flush=True)
         highest = max(scores.values())
         leaders = [model for model in models if scores.get(model) == highest]
-        names = [display_name(model) + (" [IGNORED]" if model in ignored_models else "") for model in leaders]
+        names = [display_name(model) + (
+            " [IGNORED]" if model in ignored_models else
+            " [AUTO-IGNORED]" if snapshot_models.get(model, {}).get("auto_ignored") else ""
+        ) for model in leaders]
         print("Highest raw score: " + " = ".join(names) + f" ({highest:.3f}).", flush=True)
         print("Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.", flush=True)
-        print("Ignored models cannot be loaded.", flush=True)
+        print("Ignored and auto-ignored models cannot be loaded.", flush=True)
     print("", flush=True)
     target_changed = current != decision.target
     selection_ready = warm_selection_matches(
@@ -1217,21 +1264,36 @@ class Manager:
             }
             log(f"local discovery unavailable; loading disabled: {error}")
         else:
-            visible = sorted(local, key=lambda model: (
-                list(DEFAULT_WEIGHTS).index(model) if model in DEFAULT_WEIGHTS else len(DEFAULT_WEIGHTS),
-                model,
-            ))
+            visible = ordered_model_ids(local)
             manager_state["discovery"] = {
                 "models": visible, "status": "live", "checked_at": now,
                 "fetched_at": now,
             }
             if visible != previous.get("models"):
                 log(f"local discovery refreshed: {len(visible)} models")
-        self.models = list(dict.fromkeys([
-            *(self.args.model if self.args.model is not None else visible),
-            *self.args.ignore_model,
-        ]))
         return local
+
+    def discover_catalog(self, manager_state: dict[str, Any], now: float) -> set[str]:
+        source = {"darkbloom": self.args.darkbloom, "config": str(self.args.config) if self.args.config else None}
+        previous = manager_state.get("catalog") or {}
+        if previous.get("source") != source:
+            previous = {}
+        try:
+            catalog = catalog_model_ids(self.args.darkbloom, self.args.config)
+        except Exception as error:
+            catalog = set(previous.get("models") or [])
+            status = "stale cache" if previous.get("fetched_at") else "unavailable"
+            manager_state["catalog"] = {
+                **previous, "models": ordered_model_ids(catalog), "source": source,
+                "status": status, "checked_at": now, "error": str(error),
+            }
+            log(f"model catalog unavailable; {status}: {error}")
+        else:
+            manager_state["catalog"] = {
+                "models": ordered_model_ids(catalog), "source": source,
+                "status": "live", "fetched_at": now, "checked_at": now,
+            }
+        return catalog
 
     def iteration(self) -> None:
         now = time.time()
@@ -1269,23 +1331,30 @@ class Manager:
                 "discarded a legacy pending switch so startup preload can be "
                 "synchronized and retried"
             )
+        catalog = self.discover_catalog(manager_state, now)
         local = self.discover_models(manager_state, now)
         discovery_available = manager_state["discovery"]["status"] == "live"
-        local_eligible = eligible_local_targets(
-            self.models, local, self.ignored,
-        )
-        reconcile_selection_policy(
-            manager_state, local_eligible, self.ignored,
-            discovery_available,
-        )
-        daemon = read_daemon_state(self.args.daemon_state, now=now)
-
         try:
             samples = fetch_capacity(self.args.base_url)
         except Exception as error:
             samples = {}
             log(f"network capacity unavailable: {error}")
 
+        # The catalog and capacity feed expand visibility only. They cannot
+        # authorize loading a model absent from a successful local scan.
+        visible = catalog | set(samples) | set(manager_state["discovery"].get("models") or []) | self.ignored
+        self.models = list(dict.fromkeys([
+            *(self.args.model or []), *ordered_model_ids(visible - self.ignored),
+            *self.args.ignore_model,
+        ]))
+        local_eligible = eligible_local_targets(
+            self.args.model if self.args.model is not None else self.models,
+            local, self.ignored,
+        )
+        reconcile_selection_policy(
+            manager_state, local_eligible, self.ignored,
+            discovery_available,
+        )
         history, averages = update_pressure_history(
             self.models,
             samples,
@@ -1301,6 +1370,9 @@ class Manager:
             now,
             self.args.pricing_refresh,
         )
+        # Catalog and price requests can be slow. Check freshness against the
+        # time after those reads, rather than the start of the iteration.
+        daemon = read_daemon_state(self.args.daemon_state, now=time.time())
         # Retained history remains visible during a feed gap, but is not a
         # fresh score and must not drive selection.
         all_scores = revenue_scores(
@@ -1326,6 +1398,8 @@ class Manager:
             self.args.check_every * self.args.average_samples,
             self.ignored,
             eligible_models,
+            local if discovery_available else None,
+            self.args.model,
         )
 
         current = current_warm_model(daemon, local_eligible)
@@ -1518,7 +1592,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("mode", choices=("once", "run"), nargs="?", default="once")
     parser.add_argument("--apply", action="store_true", help="actually switch models; default is dry-run")
-    parser.add_argument("--model", action="append", metavar="MODEL", help="restrict managed models; repeat in tie-break order (default: discover local models each check)")
+    parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible (default: all locally discovered models)")
     parser.add_argument(
         "--ignore-model", "--ignore", action="append", default=[], metavar="MODEL_ID",
         help="score and display this model but never select or load it; repeat as needed",

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 — 2026-09-08
+
+- Show all IDs from Darkbloom's supported-model catalog, current network
+  capacity, local scan, and explicit model flags. Refresh the catalog and local
+  scan each check using `--config` when provided.
+- Mark models absent from the local scan `AUTO-IGNORED; not downloaded or
+  filtered out`. Keep their calculations visible and saved. Downloads become
+  eligible on the next check; removals revoke pending selections.
+- Keep `--model` restrictions separate from table visibility. Show excluded
+  rows and raw-score leaders with their explicit or automatic ignore status.
+- Retain the last catalog during outages, label stale data, and show unknown
+  local availability honestly when scanning fails.
+- Check daemon freshness after catalog and pricing reads so a slow request
+  cannot make an old snapshot look current.
+
 ## 0.1.1 — 2026-09-08
 
 - Use minimum warm time and consecutive passing checks in terminal messages,

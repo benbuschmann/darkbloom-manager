@@ -57,11 +57,11 @@ Each report starts with a separator. A blank line separates the model table
 from the highest-score line.
 
 Without `--apply`, the manager prints decisions and saves its own state. It
-does not launch a model or edit startup preloads. It still reads the local
-model list through Darkbloom, which may migrate an older provider config.
+does not launch a model or edit startup preloads. It still reads the catalog
+and local model list through Darkbloom, which may migrate an older provider config.
 
 Add `--config /path/to/provider.toml` if your provider uses a custom config.
-Discovery and live launches both use that path. Use
+The catalog, local scan, and live launches all use that path. Use
 `--darkbloom /path/to/darkbloom` if the CLI is not on your `PATH`.
 
 A live switch runs `darkbloom start` with one `--model` and
@@ -132,22 +132,43 @@ warm time to preserve; an existing warm selection does.
 
 ## Discovery and ignored models
 
-Every check runs `darkbloom models list --all --json`. Downloads and removals
-appear on the next check. Repeated `--model MODEL_ID` flags restrict the
-candidates and set their tie order. Each launch still requests one model.
+The table combines three sources on every check:
+
+| Source | What it supplies |
+| --- | --- |
+| `darkbloom models catalog --json` | Supported model IDs from the coordinator in your provider config, including models you have not downloaded. |
+| Public network capacity | Model IDs and current pressure, including IDs missing from the catalog response. |
+| `darkbloom models list --all --json` | Locally discovered models. Only models in a successful local scan can be loaded. |
+
+Both Darkbloom commands respect `--config`. The catalog uses concrete model
+IDs, rather than the consumer-facing aliases shown in some Darkbloom pages.
+Explicit `--model` and `--ignore-model` IDs also remain visible.
+
+Models absent from the local scan show
+`AUTO-IGNORED; not downloaded or filtered out`. Their pressure, price, weight,
+and score are still calculated and saved when network data is available.
+They cannot be selected or loaded. Once a download appears in the local scan,
+that automatic exclusion clears. Removing a download excludes it again and
+revokes any saved pending selection for it. The manager does not download models.
+
+Repeated `--model MODEL_ID` flags restrict loading candidates and set their
+tie order. Other rows remain visible with `AUTO-IGNORED; outside --model selection`.
 Without that restriction, the four weighted models above retain their tie
-order, followed by other IDs alphabetically.
+order, followed by other IDs alphabetically. Explicit ignore IDs appear last
+unless placed earlier by `--model`. Each launch still requests one model.
 
 Use `--ignore-model MODEL_ID`, or `--ignore MODEL_ID`, to exclude a model from
 loading. The flag is repeatable and matches exact, case-sensitive IDs. Ignored
 models stay in the table, even when they are absent from the local list. Their
 rows show `IGNORED` alongside pressure, average, price, preference, and score.
-Their calculations are saved too.
+Their calculations are saved too. An explicit ignore stays in effect even if
+you download the model later.
 
 The `MODEL ID` column and decision lines use the exact IDs accepted by
 `--ignore-model`, including capitalization and any namespace prefix.
 
-`Highest raw score` includes ignored models and ties. It is measured before
+`Highest raw score` includes ignored and auto-ignored models, with their labels,
+and includes ties. It is measured before
 switch costs and thresholds. The `Decision`, `Candidate`, `Earliest switch`, and
 `Deferred` lines show what the manager can actually do. A saved pending switch
 cannot authorize an ignored model to load.
@@ -158,12 +179,15 @@ and shows the seconds remaining. `Earliest switch` is conditional: the candidate
 must keep meeting both score requirements, and the provider must be idle.
 
 Darkbloom's `--all` bypasses the enabled-model config filter, but its scanner can
-still omit downloads that exceed available memory. Listing also skips the
-serving command's runtime-capability filter. A listed model can therefore fail
-to run on your GPU. Explicit ignore IDs keep those models available for scoring.
+still omit downloads that exceed available memory. The catalog's JSON output
+does not report download status. The manager therefore cannot distinguish a
+missing download from a filtered download; the status says both. Listing also
+skips the serving command's runtime-capability filter. A listed model can still
+fail to run on your GPU. Use an explicit ignore for models your provider cannot run.
 
 This behavior was checked on September 8, 2026 against the upstream
 [list command](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/darkbloom/ModelsCommand.swift),
+[catalog client](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/ProviderCore/Models/ModelCatalogClient.swift),
 [runtime filtering](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/darkbloom/Darkbloom.swift),
 and [model scanner](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95a98e7c5353329abc52e195e9f2/provider-swift/Sources/ProviderCore/Models/ModelScanner%2BDiscovery.swift).
 
@@ -185,9 +209,10 @@ write permissions.
 | Saved data | Purpose |
 | --- | --- |
 | Timestamped pressure samples | Rebuild each model's rolling average after a restart. |
-| Latest score snapshot | Retain pressure, average, price, weight, score, and ignore/eligibility status. |
+| Latest score snapshot | Retain pressure, average, price, weight, score, local availability, and explicit or automatic ignore reasons. |
 | Price cache and fetch time | Reuse prices between refreshes and identify stale prices. |
 | Discovered model IDs, scan times, and scan errors | Show the last inventory when discovery fails. |
+| Catalog IDs, source, fetch time, and errors | Keep catalog rows visible during an outage and identify stale catalog data. |
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
 | Candidate and count of consecutive passing checks | Resume progress toward `--switch-after-checks` across restarts. Live and dry-run counts are separate. |
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
@@ -195,7 +220,7 @@ write permissions.
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
 The manager does not collect prompts, responses, API keys,
-local request counts, or per-model request rates. Discovery and launch errors
+local request counts, or per-model request rates. Catalog, discovery, and launch errors
 can contain local paths or CLI error text.
 
 Use `--state /path/to/state.json` for another location. On the first run with
@@ -222,8 +247,13 @@ refresh failure can use the last cache, labeled with its fetch time. Models
 without an explicit price use Darkbloom's public fallback price when available.
 Without any usable price, a model is excluded from selection.
 
+If the catalog request fails, the last catalog remains visible as `stale cache`.
+Without a cached catalog, the report says `Catalog: unavailable` and still shows
+IDs from the capacity feed, local scan, and your flags. Catalog membership alone
+never permits a launch.
+
 If local discovery fails, the last inventory remains visible and new launches
-are blocked.
+are blocked. Local availability is unknown, and the rows say `local scan unavailable`.
 
 ### Why hasn't it switched?
 
