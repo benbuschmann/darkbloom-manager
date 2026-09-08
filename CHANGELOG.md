@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Use minimum warm time and consecutive passing checks in terminal messages,
+  with the relevant timing flags beside wait and progress messages. Rename
+  `Challenger` to `Candidate` and `Switch ETA` to `Earliest switch`.
+- Clarify that the KEEP reason compares models allowed to load. Switching
+  rules, defaults, and saved state remain unchanged.
+
 ## 0.1.0 — 2026-09-08
 
 First public release.

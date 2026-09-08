@@ -50,7 +50,7 @@ python3 warm_model_manager.py run --apply \
 ```
 
 These settings check every minute, average up to five recent samples, require
-three consecutive checks that clear the switch thresholds, and keep a model
+three consecutive checks that meet both score requirements, and keep a model
 warm for at least 30 minutes before replacing it.
 
 Each report starts with a separator. A blank line separates the model table
@@ -87,8 +87,8 @@ The old names still work as aliases: `--interval`, `--history`,
 Samples expire after `check-every × average-samples` seconds, including while
 the manager is stopped. With `60` and `5`, the average contains at most five
 samples from the past five minutes. The table's `N` column shows how many are
-available. Changing either setting clears the old samples and confirmation
-counters.
+available. Changing either setting clears the old samples and resets the
+number of consecutive passing checks.
 
 ```text
 pressure = active requests / max(1, warm providers)
@@ -112,9 +112,9 @@ Weights must be positive; they can also name ignored models or future downloads.
 
 Before comparing a candidate with the current model, the manager discounts its
 score by `(decision-horizon − switch-cost) / decision-horizon`. It then checks
-both margins. With the defaults, a current score of `0.10` and a candidate score
-of `0.12` produce an adjusted candidate score of `0.11`. That misses the required
-`0.125`, so no switch confirmation is counted.
+both score requirements. With the defaults, a current score of `0.10` and a
+candidate score of `0.12` produce an adjusted candidate score of `0.11`. That misses the required
+`0.125`, so that check does not count toward `--switch-after-checks`.
 
 | Flag | Default | What it controls |
 | --- | --- | --- |
@@ -122,12 +122,12 @@ of `0.12` produce an adjusted candidate score of `0.11`. That misses the require
 | `--absolute-margin` | 0.01 | Required score increase, also after the discount. |
 | `--switch-cost` | 300 seconds | Estimated time lost while changing models. |
 | `--decision-horizon` | 3600 seconds | Period used to weigh that lost time. Must exceed switch cost. |
-| `--warmup-timeout` | 180 seconds | Loading grace before an unconfirmed launch is reported as overdue. |
+| `--warmup-timeout` | 180 seconds | Time to wait for the requested model to become warm before reporting loading as overdue. |
 | `--pricing-refresh` | 900 seconds | Time between price-cache refreshes. |
 
 If no eligible model is currently warm, the manager selects the highest scored
-eligible model without waiting for confirmations. It still checks daemon
-health, active requests, and pending warm-up. An empty warm list has no minimum
+eligible model without waiting for consecutive passing checks. It still checks
+daemon health, active requests, and pending warm-up. An empty warm list has no minimum
 warm time to preserve; an existing warm selection does.
 
 ## Discovery and ignored models
@@ -148,9 +148,14 @@ The `MODEL ID` column and decision lines use the exact IDs accepted by
 `--ignore-model`, including capitalization and any namespace prefix.
 
 `Highest raw score` includes ignored models and ties. It is measured before
-switch costs and thresholds. The `Decision`, `Challenger`, and `Deferred` lines
-show what the manager can actually do. A saved pending switch cannot authorize
-an ignored model to load.
+switch costs and thresholds. The `Decision`, `Candidate`, `Earliest switch`, and
+`Deferred` lines show what the manager can actually do. A saved pending switch
+cannot authorize an ignored model to load.
+
+`Candidate` shows progress such as `2/3 consecutive checks passed`, followed
+by `--switch-after-checks`. A wait for minimum warm time names `--min-warm-time`
+and shows the seconds remaining. `Earliest switch` is conditional: the candidate
+must keep meeting both score requirements, and the provider must be idle.
 
 Darkbloom's `--all` bypasses the enabled-model config filter, but its scanner can
 still omit downloads that exceed available memory. Listing also skips the
@@ -184,7 +189,7 @@ write permissions.
 | Price cache and fetch time | Reuse prices between refreshes and identify stale prices. |
 | Discovered model IDs, scan times, and scan errors | Show the last inventory when discovery fails. |
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
-| Candidate and consecutive-check counters | Continue confirmations across restarts. Live and dry-run counters are separate. |
+| Candidate and count of consecutive passing checks | Resume progress toward `--switch-after-checks` across restarts. Live and dry-run counts are separate. |
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
 | Last decision, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 
@@ -204,9 +209,9 @@ in your launch command; saved settings do not replace command-line options.
 
 ### Can I delete the state file?
 
-Stop the manager first. Deleting state removes rolling samples, confirmation
-progress, and pending warm-up tracking. For a deliberate fresh start, use a
-new `--state` path after stopping the old process. Deleting the default file
+Stop the manager first. Deleting state removes rolling samples, progress toward
+the required consecutive checks, and pending warm-up tracking. For a deliberate
+fresh start, use a new `--state` path after stopping the old process. Deleting the default file
 can cause the retained previous state to be imported again.
 
 ### What happens when data is unavailable?
@@ -222,9 +227,10 @@ are blocked.
 
 ### Why hasn't it switched?
 
-Read `Reason`, `Challenger`, and `Deferred` in the report. The candidate may need
-more consecutive checks, more warm time, or a larger score advantage. A busy,
-stopped, or stale provider also blocks a switch. Dry runs use the same gates.
+Read `Reason`, `Candidate`, and `Deferred` in the report. The candidate may need
+more passing checks (`--switch-after-checks`), the current model may need more
+warm time (`--min-warm-time`), or the score advantage may be too small. A busy,
+stopped, or stale provider also blocks a switch. Dry runs use the same rules.
 
 A failed or timed-out launch command, load error, or overdue warm-up blocks
 automatic retries. The pending target is saved before attempting the launch;

@@ -393,7 +393,7 @@ def choose_scored_target(
     if challenger == current_model:
         return Decision(
             current_model,
-            f"current model has the highest cost-adjusted score ({scores[current_model]:.3f})",
+            f"current model ranks first among models allowed to load after switch cost ({scores[current_model]:.3f})",
         )
 
     current_score = scores[current_model]
@@ -403,7 +403,7 @@ def choose_scored_target(
     if challenger_score < relative_floor or challenger_score < absolute_floor:
         return Decision(
             current_model,
-            f"{challenger} does not clear both switch margins after cost "
+            f"{challenger} does not meet both score requirements after switch cost "
             f"({challenger_score:.3f} vs current {current_score:.3f}; "
             f"need >= {relative_floor:.3f} and >= {absolute_floor:.3f})",
             challenger=challenger,
@@ -413,15 +413,15 @@ def choose_scored_target(
     if streak < confirmations:
         return Decision(
             current_model,
-            f"{challenger} clears both margins; confirmation "
-            f"{streak}/{confirmations}",
+            f"{challenger} meets both score requirements; "
+            f"{streak}/{confirmations} consecutive checks passed (--switch-after-checks)",
             challenger=challenger,
             challenger_streak=streak,
         )
     return Decision(
         challenger,
-        f"{challenger} cleared both margins for {streak} consecutive checks "
-        f"({challenger_score:.3f} cost-adjusted vs {current_score:.3f})",
+        f"{challenger} met both score requirements for {streak} consecutive checks "
+        f"({challenger_score:.3f} after switch cost vs current {current_score:.3f}; --switch-after-checks)",
         challenger=challenger,
         challenger_streak=streak,
     )
@@ -552,7 +552,7 @@ def reconcile_pending_switch(
         manager_state["last_switch_at"] = now
         return Decision(
             target,
-            f"warm-up confirmed after {format_duration(elapsed)}; starting minimum dwell",
+            f"warm-up confirmed after {format_duration(elapsed)}; starting minimum warm time (--min-warm-time)",
         )
 
     if pending.get("command_error"):
@@ -578,15 +578,15 @@ def reconcile_pending_switch(
         remaining = warmup_timeout - elapsed
         return Decision(
             target,
-            f"waiting for Darkbloom to finish loading; grace has "
-            f"{format_duration(remaining)} remaining",
+            f"waiting for Darkbloom to finish loading; "
+            f"{format_duration(remaining)} remaining before --warmup-timeout",
             warming=True,
         )
 
     return Decision(
         target,
-        f"warm-up exceeded {format_duration(warmup_timeout)}; automatic restart is "
-        "blocked—inspect `darkbloom status` and logs",
+        f"model loading exceeded {format_duration(warmup_timeout)} (--warmup-timeout); automatic restart is "
+        "blocked; inspect `darkbloom status` and logs",
         warming=True,
     )
 
@@ -965,7 +965,7 @@ def switch_block_reason(
         return "this provider is actively serving a request"
     anchor = dwell_anchor(manager_state, daemon)
     if anchor and now - anchor < min_dwell:
-        return f"minimum dwell has {math.ceil(min_dwell - (now - anchor))} seconds remaining"
+        return f"minimum warm time: {math.ceil(min_dwell - (now - anchor))} seconds remaining (--min-warm-time)"
     return None
 
 
@@ -991,7 +991,7 @@ def switch_forecast(
         if decision.target:
             return (
                 f"{display_name(decision.target)} can switch at the next safe action "
-                "once Darkbloom is online, idle, and minimum dwell permits"
+                "once Darkbloom is online and idle and any minimum warm time has elapsed (--min-warm-time)"
             )
         return None
 
@@ -1001,8 +1001,8 @@ def switch_forecast(
     contender = decision.challenger or decision.target
     if decision.target == current and decision.challenger_streak <= 0:
         return (
-            f"no estimate yet — {display_name(contender)} is the leading contender "
-            "but does not clear both switch margins"
+            f"no estimate yet; {display_name(contender)} "
+            "does not meet both score requirements"
         )
 
     remaining_checks = 0
@@ -1021,7 +1021,7 @@ def switch_forecast(
         wait = math.ceil(wait / interval_seconds) * interval_seconds
 
     condition = (
-        f"if {display_name(contender)} keeps clearing both margins and the provider is idle"
+        f"if {display_name(contender)} keeps meeting both score requirements and the provider is idle"
     )
     if wait <= 0:
         if daemon and daemon.inference_active:
@@ -1138,7 +1138,8 @@ def print_report(
         leaders = [model for model in models if scores.get(model) == highest]
         names = [display_name(model) + (" [IGNORED]" if model in ignored_models else "") for model in leaders]
         print("Highest raw score: " + " = ".join(names) + f" ({highest:.3f}).", flush=True)
-        print("Raw ranking is before switch cost, margins, confirmations and dwell; ignored models cannot switch.", flush=True)
+        print("Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.", flush=True)
+        print("Ignored models cannot be loaded.", flush=True)
     print("", flush=True)
     target_changed = current != decision.target
     selection_ready = warm_selection_matches(
@@ -1162,16 +1163,16 @@ def print_report(
     print(f"Decision:  {action} → {display_name(decision.target)}", flush=True)
     if decision.challenger and decision.target == current:
         progress = (
-            f" — confirmation {decision.challenger_streak}/{confirmations}"
+            f" — {decision.challenger_streak}/{confirmations} consecutive checks passed (--switch-after-checks)"
             if decision.challenger_streak > 0
-            else " — not yet switch-eligible"
+            else " — needs a larger score advantage"
         )
         print(
-            f"Challenger: {display_name(decision.challenger)}{progress}",
+            f"Candidate: {display_name(decision.challenger)}{progress}",
             flush=True,
         )
     if forecast:
-        print(f"Switch ETA: {forecast}", flush=True)
+        print(f"Earliest switch: {forecast}", flush=True)
     print(f"Reason:    {decision.reason}", flush=True)
     if blocked and decision.target is not None and not selection_ready and not decision.warming:
         print(f"Deferred:  {blocked}", flush=True)
@@ -1181,7 +1182,7 @@ def print_report(
         flush=True,
     )
     print(
-        f"N is retained timestamped samples (max {history_size}); samples expire "
+        f"N is the number of retained samples (max {history_size}, --average-samples); samples expire "
         f"after {format_duration(interval_seconds * history_size)}.",
         flush=True,
     )
@@ -1260,9 +1261,9 @@ class Manager:
         )
         discarded_legacy_pending = ensure_preload_sync_policy(manager_state)
         if migrated_history:
-            log("pressure history initialized with timestamped samples")
+            log("initialized timestamped pressure samples")
         elif cadence_changed:
-            log("pressure history reset because check timing or sample count changed")
+            log("saved pressure samples and consecutive check counts reset because --check-every or --average-samples changed")
         if discarded_legacy_pending:
             log(
                 "discarded a legacy pending switch so startup preload can be "
@@ -1446,7 +1447,7 @@ class Manager:
                 manager_state["pending_switch"]["command_error"] = str(error)
                 write_json_atomic(self.state_path, manager_state)
                 raise
-            log(f"switch command accepted: {decision.target}; waiting for warm confirmation")
+            log(f"switch command accepted: {decision.target}; waiting for Darkbloom to report the model warm")
 
         if selection_matches:
             manager_state["active_target"] = decision.target
@@ -1475,7 +1476,7 @@ class Manager:
             remaining = max(0.0, self.args.check_every - (time.monotonic() - started))
             if not self.stop_requested:
                 log(
-                    f"manager is running; next check in {format_duration(remaining)} "
+                    f"manager is running; next check in {format_duration(remaining)} (--check-every) "
                     "(Ctrl-C to stop)"
                 )
             deadline = time.monotonic() + remaining
@@ -1532,11 +1533,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--check-every", "--interval", type=int, default=900, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 900)")
     parser.add_argument("--average-samples", "--history", type=int, default=3, metavar="COUNT", help="average up to this many recent pressure samples (default 3)")
-    parser.add_argument("--relative-margin", type=nonnegative_float, default=0.25, help="required fractional challenger advantage (default 0.25)")
-    parser.add_argument("--absolute-margin", type=nonnegative_float, default=0.01, help="required absolute revenue-score advantage (default 0.01)")
-    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=2, metavar="COUNT", help="require this many consecutive checks clearing both switch margins (default 2)")
+    parser.add_argument("--relative-margin", type=nonnegative_float, default=0.25, help="required score increase after switch cost, as a fraction of the current score (default 0.25)")
+    parser.add_argument("--absolute-margin", type=nonnegative_float, default=0.01, help="required additional score after switch cost (default 0.01)")
+    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=2, metavar="COUNT", help="require this many consecutive checks meeting both score requirements (default 2)")
     parser.add_argument("--min-warm-time", "--min-dwell", type=int, default=2700, metavar="SECONDS", help="keep the current model warm at least this long before switching (default 2700)")
-    parser.add_argument("--warmup-timeout", type=positive_float, default=180, help="minimum grace for a requested model to become warm (default 180)")
+    parser.add_argument("--warmup-timeout", type=positive_float, default=180, help="seconds to wait for the requested model to become warm before reporting loading as overdue (default 180)")
     parser.add_argument("--switch-cost", type=nonnegative_float, default=300, help="estimated unavailable seconds per switch (default 300)")
     parser.add_argument("--decision-horizon", type=positive_float, default=3600, help="seconds over which a switch must repay its cost (default 3600)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Darkbloom public console base URL")

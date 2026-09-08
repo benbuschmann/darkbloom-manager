@@ -323,7 +323,7 @@ class ScoreDecisionTests(unittest.TestCase):
             decision_horizon_seconds=3600,
         )
         self.assertEqual(decision.target, "gemma")
-        self.assertIn("does not clear", decision.reason)
+        self.assertIn("does not meet both score requirements", decision.reason)
         self.assertEqual(decision.challenger, "gpt")
         self.assertEqual(decision.challenger_streak, 0)
 
@@ -413,7 +413,7 @@ class RuntimeForecastTests(unittest.TestCase):
             "gemma",
             Decision(
                 "gemma",
-                "q36 clears both margins; confirmation 1/3",
+                "q36 meets both score requirements; 1/3 consecutive checks passed",
                 challenger="q36",
                 challenger_streak=1,
             ),
@@ -426,14 +426,14 @@ class RuntimeForecastTests(unittest.TestCase):
         )
         assert forecast is not None
         self.assertIn("about 29 minutes", forecast)
-        self.assertIn("keeps clearing both margins", forecast)
+        self.assertIn("keeps meeting both score requirements", forecast)
 
     def test_margin_failing_contender_has_no_false_countdown(self) -> None:
         forecast = switch_forecast(
             "gemma",
             Decision(
                 "gemma",
-                "q36 does not clear both switch margins",
+                "q36 does not meet both score requirements",
                 challenger="q36",
             ),
             {"last_switch_at": 1_000},
@@ -445,7 +445,7 @@ class RuntimeForecastTests(unittest.TestCase):
         )
         assert forecast is not None
         self.assertIn("no estimate yet", forecast)
-        self.assertIn("does not clear both switch margins", forecast)
+        self.assertIn("does not meet both score requirements", forecast)
 
 
 class DaemonStateTests(unittest.TestCase):
@@ -981,7 +981,7 @@ class ManagerIntegrationTests(unittest.TestCase):
             state, report = self.tick(10000 + i * 60)
             self.assertEqual(state["live_challenger_streak"], i + 1)
         self.assertEqual(state["last_decision_target"], "challenger")
-        self.assertIn("minimum dwell", report)
+        self.assertIn("minimum warm time", report)
         self.launch.assert_not_called()
         self.tick(11700)
         self.launch.assert_called_once_with("darkbloom", "challenger", None, {IGNORED})
@@ -1267,7 +1267,7 @@ class ManagerIntegrationTests(unittest.TestCase):
             self.args.apply = apply
             for busy, last_switch, reason in (
                 (True, 100, "actively serving"),
-                (False, 10000, "minimum dwell"),
+                (False, 10000, "minimum warm time"),
             ):
                 with self.subTest(apply=apply, busy=busy):
                     self.save({**original, "last_switch_at": last_switch})
