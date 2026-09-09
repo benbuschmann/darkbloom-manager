@@ -31,10 +31,6 @@ Preview one check:
 
 ```sh
 python3 warm_model_manager.py once \
-  --check-every 60 \
-  --average-samples 5 \
-  --switch-after-checks 3 \
-  --min-warm-time 1800 \
   --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
 ```
 
@@ -42,16 +38,13 @@ For continuous loading:
 
 ```sh
 python3 warm_model_manager.py run --apply \
-  --check-every 60 \
-  --average-samples 5 \
-  --switch-after-checks 3 \
-  --min-warm-time 1800 \
   --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
 ```
 
-These settings check every minute, average up to five recent samples, require
+The defaults check every minute, average up to 15 recent samples, require
 three consecutive checks that meet both score requirements, and keep a model
-warm for at least 30 minutes before replacing it.
+warm for at least 45 minutes before replacing it. Use the timing flags below
+to override them.
 
 Each report starts with a separator. A blank line separates the model table
 from the highest-score line.
@@ -76,17 +69,17 @@ manager's saved switch time is older.
 
 | Flag | Default | What it controls |
 | --- | --- | --- |
-| `--check-every SECONDS` | 900 | Seconds between checks. Minimum: 60. |
-| `--average-samples COUNT` | 3 | Maximum number of recent pressure samples to average. |
-| `--switch-after-checks COUNT` | 2 | Consecutive checks the same candidate must pass before switching. |
+| `--check-every SECONDS` | 60 | Seconds between checks. Minimum: 60. |
+| `--average-samples COUNT` | 15 | Maximum number of recent pressure samples to average. |
+| `--switch-after-checks COUNT` | 3 | Consecutive checks the same candidate must pass before switching. |
 | `--min-warm-time SECONDS` | 2700 | Minimum time to keep a warm model before replacing it. |
 
 The old names still work as aliases: `--interval`, `--history`,
 `--confirmations`, and `--min-dwell`, respectively.
 
 Samples expire after `check-every × average-samples` seconds, including while
-the manager is stopped. With `60` and `5`, the average contains at most five
-samples from the past five minutes. The table's `N` column shows how many are
+the manager is stopped. With the defaults of `60` and `15`, the average contains
+at most 15 samples from the past 15 minutes. The table's `N` column shows how many are
 available. Changing either setting clears the old samples and resets the
 number of consecutive passing checks.
 

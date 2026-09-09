@@ -65,7 +65,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.2")
+        self.assertEqual(MANAGER_VERSION, "0.1.3")
 
     def test_default_qwen_preference_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -760,7 +760,7 @@ class CliAndStateTests(unittest.TestCase):
         self.assertEqual(
             (defaults.check_every, defaults.average_samples,
              defaults.switch_after_checks, defaults.min_warm_time),
-            (900, 3, 2, 2700),
+            (60, 15, 3, 2700),
         )
 
     def test_validation_uses_new_flag_names_before_external_io(self) -> None:

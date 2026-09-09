@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.2"
+MANAGER_VERSION = "0.1.3"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -1605,11 +1605,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MODEL=WEIGHT",
         help="soft model preference multiplier; repeat as needed",
     )
-    parser.add_argument("--check-every", "--interval", type=int, default=900, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 900)")
-    parser.add_argument("--average-samples", "--history", type=int, default=3, metavar="COUNT", help="average up to this many recent pressure samples (default 3)")
+    parser.add_argument("--check-every", "--interval", type=int, default=60, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 60)")
+    parser.add_argument("--average-samples", "--history", type=int, default=15, metavar="COUNT", help="average up to this many recent pressure samples (default 15)")
     parser.add_argument("--relative-margin", type=nonnegative_float, default=0.25, help="required score increase after switch cost, as a fraction of the current score (default 0.25)")
     parser.add_argument("--absolute-margin", type=nonnegative_float, default=0.01, help="required additional score after switch cost (default 0.01)")
-    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=2, metavar="COUNT", help="require this many consecutive checks meeting both score requirements (default 2)")
+    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=3, metavar="COUNT", help="require this many consecutive checks meeting both score requirements (default 3)")
     parser.add_argument("--min-warm-time", "--min-dwell", type=int, default=2700, metavar="SECONDS", help="keep the current model warm at least this long before switching (default 2700)")
     parser.add_argument("--warmup-timeout", type=positive_float, default=180, help="seconds to wait for the requested model to become warm before reporting loading as overdue (default 180)")
     parser.add_argument("--switch-cost", type=nonnegative_float, default=300, help="estimated unavailable seconds per switch (default 300)")

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3 — 2026-09-08
+
+- Check every 60 seconds, average up to 15 recent samples, and require three
+  consecutive passing checks by default. Keep the minimum warm time at
+  2,700 seconds (45 minutes).
+- Update CLI help and README examples to match. Timing flags still override
+  these defaults. Changing the check interval or sample count clears old
+  samples and passing-check counts through the existing state handling.
+
 ## 0.1.2 — 2026-09-08
 
 - Show all IDs from Darkbloom's supported-model catalog, current network
