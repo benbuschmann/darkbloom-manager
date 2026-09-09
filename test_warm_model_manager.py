@@ -68,9 +68,9 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.4")
+        self.assertEqual(MANAGER_VERSION, "0.1.5")
 
-    def test_default_qwen_preference_weights(self) -> None:
+    def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
         self.assertEqual(
             DEFAULT_WEIGHTS["qwen3.6-35b-a3b-vl-mtp-mxfp8"],
@@ -170,7 +170,7 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(state["preload_sync_schema"], 1)
         self.assertFalse(ensure_preload_sync_policy(state))
 
-    def test_revenue_score_combines_pressure_price_and_preference(self) -> None:
+    def test_revenue_score_combines_pressure_price_and_weight(self) -> None:
         scores = revenue_scores(
             {"q35": 0.5, "gpt": 0.5, "q9": 2.0},
             {"q35": 1.25, "gpt": 1.0},
@@ -210,7 +210,7 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(values["input_usd_per_million"], 0.08)
         self.assertEqual(values["output_usd_per_million"], 0.75)
         self.assertAlmostEqual(values["blended_usd_per_million"], 0.1805)
-        self.assertEqual(values["preference"], 1.15)
+        self.assertEqual(values["weight"], 1.15)
         self.assertEqual(values["score"], 0.0622725)
 
     def test_public_micro_usd_prices_convert_to_usd_per_million(self) -> None:
@@ -996,7 +996,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(row["input_usd_per_million"], 0.15)
         self.assertEqual(row["output_usd_per_million"], 2.0)
         self.assertAlmostEqual(row["blended_usd_per_million"], 0.4275)
-        self.assertEqual(row["preference"], 1)
+        self.assertEqual(row["weight"], 1)
         self.assertAlmostEqual(row["score"], 42.75)
         self.assertEqual(state["pressure_history"][IGNORED], [{"at": 10000, "pressure": 100}])
         self.assertEqual(state["last_decision_target"], "good")
@@ -1010,7 +1010,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.capacity.return_value = self.samples(**{q35: 1, q9: 4})
         self.prices.return_value = ({q35: ModelPrice(0.08, 0.75), q9: ModelPrice(0.08, 0.13)}, ModelPrice(0.05, 0.20))
         self.daemon.return_value = LocalDaemonState(q35, (q35,), False, 123, 100, True)
-        # Output-only pricing would prefer q35: 0.9375 versus q9's 0.52.
+        # Output-only pricing ranks q35 first: 0.9375 versus q9's 0.52.
         # The blend gives q9 0.35 (0.32083 after switch cost) versus 0.225625.
         for apply in (False, True):
             with self.subTest(apply=apply):
@@ -1034,7 +1034,7 @@ class ManagerIntegrationTests(unittest.TestCase):
                     self.launch.assert_not_called()
                     self.assertIn("WOULD SWITCH", report)
                 header = next(line for line in report.splitlines() if line.startswith("MODEL ID"))
-                self.assertEqual(header.split(), ["MODEL", "ID", "NOW", "AVG", "5m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "PREF", "SCORE", "STATUS"])
+                self.assertEqual(header.split(), ["MODEL", "ID", "NOW", "AVG", "5m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "WEIGHT", "SCORE", "STATUS"])
                 q9_row = next(line for line in report.splitlines() if line.startswith("  " + q9))
                 self.assertEqual(q9_row.split()[4:9], ["0.0800", "0.1300", "0.0875", "1.00", "0.350"])
                 self.assertIn("\n" + "=" * len(header) + "\n", report)
@@ -1118,7 +1118,7 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.assertEqual(row["now_pressure"], 1000)
                 self.assertEqual(row["average_pressure"], 1000)
                 self.assertEqual(row["score"], 200)
-                self.assertEqual(row["preference"], 1)
+                self.assertEqual(row["weight"], 1)
                 self.assertFalse(row["ignored"])
                 self.assertTrue(row["auto_ignored"])
                 self.assertFalse(row["local_available"])
@@ -1340,7 +1340,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         state, _ = self.tick(10060)
         self.assertEqual(self.manager.models, ["future", IGNORED])
         row = state["last_score_snapshot"]["models"]["future"]
-        self.assertEqual(row["preference"], 1.7)
+        self.assertEqual(row["weight"], 1.7)
         self.assertAlmostEqual(row["score"], 3 * 0.2 * 1.7)
         self.assertEqual(state["last_decision_target"], "future")
         self.assertNotIn("good", state["pressure_history"])

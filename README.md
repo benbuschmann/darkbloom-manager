@@ -86,7 +86,7 @@ number of consecutive passing checks.
 ```text
 pressure = active requests / max(1, warm providers)
 blended price = (input price × 0.85) + (output price × 0.15)
-score = average pressure × blended price × preference weight
+score = average pressure × blended price × weight
 ```
 
 Prices are USD per million tokens. Every model uses the same fixed mix:
@@ -95,7 +95,7 @@ Prices still refresh from Darkbloom's public endpoint.
 
 For example, an input price of `$0.08/M` and an output price of `$0.13/M`
 give a blended price of `$0.0875/M` total tokens. At average pressure `2.0`
-and preference `1.00`, the score is `0.175`.
+and weight `1.00`, the score is `0.175`.
 
 The score compares models at that assumed mix. It does not measure your
 provider's throughput, actual token mix, or payouts, and does not reproduce
@@ -105,9 +105,9 @@ per-request billing rounding.
 | --- | --- |
 | `IN$/M` | Input price per million input tokens. |
 | `OUT$/M` | Output price per million output tokens. |
-| `BLEND$/M` | Price per million total tokens at the fixed 85/15 mix, before pressure and preference. |
-| `PREF` | Your model preference weight. |
-| `SCORE` | Average pressure × blended price × preference. |
+| `BLEND$/M` | Price per million total tokens at the fixed 85/15 mix, before pressure and weight. |
+| `WEIGHT` | The model score multiplier, set with `--weight`. |
+| `SCORE` | Average pressure × blended price × weight. |
 
 Price columns show four decimal places. Calculations use the full values.
 `BLEND$/M` replaces the earlier `PROJ$/M` column.
@@ -120,7 +120,8 @@ Price columns show four decimal places. Calculations use the full values.
 | `gpt-oss-20b` | 1.00 |
 | Other models | 1.00 |
 
-Set a preference with `--weight MODEL_ID=WEIGHT`. Repeat it for more models.
+Set a weight with `--weight MODEL_ID=WEIGHT`. Repeat it for more models.
+For example, `--weight Qwen3.5-9B=1.25` increases that model's score by 25%.
 Weights must be positive; they can also name ignored models or future downloads.
 
 Before comparing a candidate with the current model, the manager discounts its
@@ -177,7 +178,7 @@ unless placed earlier by `--model`. Each launch still requests one model.
 Use `--ignore-model MODEL_ID`, or `--ignore MODEL_ID`, to exclude a model from
 loading. The flag is repeatable and matches exact, case-sensitive IDs. Ignored
 models stay in the table, even when they are absent from the local list. Their
-rows show `IGNORED` alongside pressure, average, both prices, blend, preference, and score.
+rows show `IGNORED` alongside pressure, average, both prices, blend, weight, and score.
 Their calculations are saved too. An explicit ignore stays in effect even if
 you download the model later.
 

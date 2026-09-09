@@ -1,9 +1,18 @@
 # Changelog
 
+## 0.1.5 — 2026-09-09
+
+- Rename the table's `PREF` column to `WEIGHT`, matching `--weight`. Use
+  weight consistently in code, help text, formulas, tests, and README examples.
+- Save each model's score multiplier under `weight` in the latest score
+  snapshot. Existing snapshots are replaced on the next check; pressure
+  history, passing-check counts, and pending warm-up remain intact.
+- Keep the score formula, weights, timing defaults, and switching rules unchanged.
+
 ## 0.1.4 — 2026-09-09
 
 - Score every model using average pressure × (85% input price + 15% output
-  price) × preference. Keep existing weights, timing defaults, switch costs,
+  price) × weight. Keep existing weights, timing defaults, switch costs,
   and relative/absolute score requirements.
 - Show `IN$/M`, `OUT$/M`, and `BLEND$/M` with four decimal places. Replace
   `PROJ$/M` and save both prices, the blend, and the fixed token mix with each
@@ -63,7 +72,7 @@ First public release.
 - Load one model at a time. Ignored models stay visible with their calculations
   but cannot be selected, loaded, or restored from a pending switch.
 - Score timestamped average pressure against public output-token prices and
-  preference weights. Show unavailable data and ignored raw-score leaders.
+  model weights. Show unavailable data and ignored raw-score leaders.
 - Apply switch costs, margins, consecutive checks, minimum warm time, and
   idle/fresh-daemon checks. Confirm warm-up before starting minimum warm time.
 - Save pending state before attempting a launch. Failed, timed-out, or

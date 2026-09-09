@@ -2,7 +2,7 @@
 """Portable revenue-aware Darkbloom single-model warm loader.
 
 The score combines average network pressure, a fixed mix of 85% input and
-15% output token prices, and a preference weight. It compares models at the
+15% output token prices, and a model weight. It compares models at the
 same assumed token mix without measuring provider throughput or actual payouts.
 
 Every selection requests exactly one warm model. The catalog, network capacity,
@@ -36,7 +36,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.4"
+MANAGER_VERSION = "0.1.5"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -416,7 +416,7 @@ def build_score_snapshot(
             "input_usd_per_million": price.input_usd,
             "output_usd_per_million": price.output_usd,
             "blended_usd_per_million": price.blended_usd,
-            "preference": weights.get(model, 1.0),
+            "weight": weights.get(model, 1.0),
             "score": scores.get(model),
             "ignored": ignored,
             "auto_ignored": auto_ignored,
@@ -1167,7 +1167,7 @@ def print_report(
     average_label = f"AVG {format_duration(interval_seconds * history_size)}"
     table_header = (
         f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} "
-        f"{'IN$/M':>7} {'OUT$/M':>7} {'BLEND$/M':>8} {'PREF':>5} {'SCORE':>7} STATUS"
+        f"{'IN$/M':>7} {'OUT$/M':>7} {'BLEND$/M':>8} {'WEIGHT':>6} {'SCORE':>7} STATUS"
     )
 
     print("", flush=True)
@@ -1227,7 +1227,7 @@ def print_report(
             f"{number(averages.get(model)):>8} {sample_count:>3} "
             f"{number(price.input_usd, 4):>7} {number(price.output_usd, 4):>7} "
             f"{number(price.blended_usd, 4):>8} "
-            f"{weights.get(model, 1.0):>5.2f} {number(scores.get(model)):>7} "
+            f"{weights.get(model, 1.0):>6.2f} {number(scores.get(model)):>7} "
             + "; ".join(status),
             flush=True,
         )
@@ -1282,7 +1282,7 @@ def print_report(
         f"BLEND$/M = {INPUT_TOKEN_SHARE:.0%} input price + {OUTPUT_TOKEN_SHARE:.0%} output price per million total tokens.",
         flush=True,
     )
-    print("Score = average pressure × BLEND$/M × preference (ranking estimate).", flush=True)
+    print("Score = average pressure × BLEND$/M × weight (ranking estimate).", flush=True)
     print(
         f"N is the number of retained samples (max {history_size}, --average-samples); samples expire "
         f"after {format_duration(interval_seconds * history_size)}.",
@@ -1661,7 +1661,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_weight,
         default=[],
         metavar="MODEL=WEIGHT",
-        help="soft model preference multiplier; repeat as needed",
+        help="model score multiplier; repeat as needed",
     )
     parser.add_argument("--check-every", "--interval", type=int, default=60, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 60)")
     parser.add_argument("--average-samples", "--history", type=int, default=15, metavar="COUNT", help="average up to this many recent pressure samples (default 15)")
