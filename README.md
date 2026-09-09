@@ -42,7 +42,7 @@ python3 warm_model_manager.py run --apply \
 ```
 
 The defaults check every minute, average up to 15 recent samples, require
-three consecutive checks that meet both score requirements, and keep a model
+three consecutive checks that meet the 25% improvement requirement, and keep a model
 warm for at least 45 minutes before replacing it. Use the timing flags below
 to override them.
 
@@ -125,23 +125,41 @@ For example, `--weight Qwen3.5-9B=1.25` increases that model's score by 25%.
 Weights must be positive; they can also name ignored models or future downloads.
 
 Before comparing a candidate with the current model, the manager discounts its
-score by `(decision-horizon − switch-cost) / decision-horizon`. It then checks
-both score requirements. With the defaults, a current score of `0.10` and a
-candidate score of `0.12` produce an adjusted candidate score of `0.11`. That misses the required
-`0.125`, so that check does not count toward `--switch-after-checks`.
+score for the estimated time lost while switching:
 
-The switch thresholds remain 25% and `0.01`. Blended scores are usually smaller
-than output-only scores, so the `0.01` absolute requirement can be relatively
-stricter. Both requirements still have to pass.
+```text
+adjusted candidate score = candidate score × (decision-horizon − switch-cost) / decision-horizon
+required score = current score × (1 + switch-improvement-percent / 100)
+```
+
+The default requires at least 25% improvement after that discount. For a current
+score of `0.010`, an adjusted candidate score of `0.013` is a 30% improvement and
+passes. An adjusted score of `0.012` is a 20% improvement and fails. There is no
+fixed score increase to clear.
+
+Use `--switch-improvement-percent 25` for 25%, or
+`--switch-improvement-percent 1` for 1%. A value of `0.25` means 0.25% with this
+flag. The report shows the requirement and the candidate's improvement after
+switch cost. A failing check resets the consecutive passing count.
+
+Equal scores keep the current model, including when both scores are zero.
+A positive candidate can pass against a zero current score; it still needs
+the required consecutive checks and minimum warm time.
 
 | Flag | Default | What it controls |
 | --- | --- | --- |
-| `--relative-margin` | 0.25 | Required score advantage after the discount: 25%. |
-| `--absolute-margin` | 0.01 | Required score increase, also after the discount. |
+| `--switch-improvement-percent PERCENT` | 25 | Required percentage improvement after switch cost. Must be nonnegative. |
 | `--switch-cost` | 300 seconds | Estimated time lost while changing models. |
 | `--decision-horizon` | 3600 seconds | Period used to weigh that lost time. Must exceed switch cost. |
 | `--warmup-timeout` | 180 seconds | Time to wait for the requested model to become warm before reporting loading as overdue. |
 | `--pricing-refresh` | 900 seconds | Time between price-cache refreshes. |
+
+The older `--relative-margin 0.25` form still means 25%. Use either that flag
+or `--switch-improvement-percent`, never both. `--absolute-margin` has been
+removed; the manager reports an error if it appears in your command.
+
+Changing the percentage, switch cost, or decision horizon resets live and
+dry-run passing-check counts. Pressure history and minimum warm time remain.
 
 If no eligible model is currently warm, the manager selects the highest scored
 eligible model without waiting for consecutive passing checks. It still checks
@@ -194,7 +212,7 @@ cannot authorize an ignored model to load.
 `Candidate` shows progress such as `2/3 consecutive checks passed`, followed
 by `--switch-after-checks`. A wait for minimum warm time names `--min-warm-time`
 and shows the seconds remaining. `Earliest switch` is conditional: the candidate
-must keep meeting both score requirements, and the provider must be idle.
+must keep meeting the percentage requirement, and the provider must be idle.
 
 Darkbloom's `--all` bypasses the enabled-model config filter, but its scanner can
 still omit downloads that exceed available memory. The catalog's JSON output
@@ -234,6 +252,7 @@ write permissions.
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
 | Candidate and count of consecutive passing checks | Resume progress toward `--switch-after-checks` across restarts. Live and dry-run counts are separate. |
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
+| Percentage requirement, switch cost, and decision horizon | Reset passing-check counts when the switch rule changes. |
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
@@ -283,8 +302,9 @@ are blocked. Local availability is unknown, and the rows say `local scan unavail
 
 Read `Reason`, `Candidate`, and `Deferred` in the report. The candidate may need
 more passing checks (`--switch-after-checks`), the current model may need more
-warm time (`--min-warm-time`), or the score advantage may be too small. A busy,
-stopped, or stale provider also blocks a switch. Dry runs use the same rules.
+warm time (`--min-warm-time`), or the improvement after switch cost may be below
+`--switch-improvement-percent`. A busy, stopped, or stale provider also blocks
+a switch. Dry runs use the same rules.
 
 A failed or timed-out launch command, load error, or overdue warm-up blocks
 automatic retries. The pending target is saved before attempting the launch;
@@ -312,9 +332,17 @@ mv warm_model_manager.py.new warm_model_manager.py &&
 python3 warm_model_manager.py --version
 ```
 
-Then use your existing launch command. Replacing the script leaves saved state
-intact. [Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
-are available on GitHub. The commands and filenames stay the same across releases.
+Remove obsolete flags as described below, then run your launch command.
+Replacing the script leaves saved state intact.
+[Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
+are available on GitHub. Script and state filenames stay the same across releases.
+
+The percentage-based switch rule replaces the old fixed `0.01` score requirement.
+Remove `--absolute-margin` if you used it. The default remains 25% improvement;
+`--relative-margin 0.25` still works, or use `--switch-improvement-percent 25`.
+The first check after this upgrade resets live and dry-run passing-check counts
+once. Pressure history, minimum warm time, and any already-issued pending launch
+stay in place.
 
 When upgrading from output-only scoring, the manager fetches both prices before
 scoring. If that fetch fails, prices remain unavailable until it succeeds.

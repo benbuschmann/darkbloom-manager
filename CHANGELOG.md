@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.6 — 2026-09-09
+
+- Replace the fixed `0.01` score requirement with one percentage-based switch
+  rule. `--switch-improvement-percent 25` requires at least 25% improvement
+  after switch cost, regardless of score size. The default is 25%.
+- Show the percentage requirement and the candidate's improvement in reports.
+  Keep equal scores on the current model, including zero-score ties.
+- Keep `--relative-margin 0.25` as the older form of 25%. Reject
+  `--absolute-margin` with instructions to use the percentage flag.
+- Reset live and dry-run passing-check counts when adopting the new rule or
+  changing the percentage, switch cost, or decision horizon. Preserve pressure
+  history, minimum warm time, and already-issued pending launches.
+- Update README examples, flag descriptions, and upgrade notes. Add tests for
+  small scores, percentage boundaries, switch costs, zero scores, and state upgrades.
+
 ## 0.1.5 — 2026-09-09
 
 - Rename the table's `PREF` column to `WEIGHT`, matching `--weight`. Use

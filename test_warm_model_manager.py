@@ -33,6 +33,7 @@ from warm_model_manager import (
     ensure_pressure_cadence,
     ensure_preload_sync_policy,
     ensure_scoring_policy,
+    ensure_switch_policy,
     eligible_local_targets,
     fetch_model_prices,
     format_duration,
@@ -68,7 +69,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.5")
+        self.assertEqual(MANAGER_VERSION, "0.1.6")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -348,6 +349,24 @@ class CapacityTests(unittest.TestCase):
         self.assertFalse(ensure_scoring_policy(state))
         self.assertEqual(state["live_challenger_streak"], 1)
 
+    def test_switch_rule_resets_counts_only_when_percentage_or_cost_changes(self) -> None:
+        preserved = {
+            "pressure_history": {"good": [{"at": 1000, "pressure": 1}]},
+            "pricing_cache": {"fetched_at": 1000},
+            "pending_switch": {"target": "good", "warm_models": ["good"], "command_at": 1000},
+            "last_switch_at": 500,
+        }
+        state = dict(preserved)
+        for percent, cost, horizon in ((25, 300, 3600), (1, 300, 3600), (1, 0, 3600), (1, 0, 7200)):
+            state.update(live_challenger_model="next", live_challenger_streak=2,
+                         dry_challenger_model="next", dry_challenger_streak=2)
+            self.assertTrue(ensure_switch_policy(state, percent, cost, horizon))
+            self.assertFalse(any("challenger" in key for key in state))
+            self.assertTrue(all(state[key] == value for key, value in preserved.items()))
+            state["live_challenger_streak"] = 1
+            self.assertFalse(ensure_switch_policy(state, percent, cost, horizon))
+            self.assertEqual(state["live_challenger_streak"], 1)
+
     def test_duration_labels_match_test_and_production_intervals(self) -> None:
         self.assertEqual(format_duration(59.2), "60s")
         self.assertEqual(format_duration(3 * 60), "3m")
@@ -371,6 +390,73 @@ class CapacityTests(unittest.TestCase):
 
 
 class ScoreDecisionTests(unittest.TestCase):
+    def test_percentage_threshold_is_independent_of_score_scale(self) -> None:
+        for scale in (0.000001, 0.005, 0.01, 0.08, 1.0, 1000.0):
+            for percent in (1.0, 25.0, 200.0):
+                for gain, passes in ((percent - 0.001, False), (percent, True), (percent + 1, True)):
+                    with self.subTest(scale=scale, percent=percent, gain=gain):
+                        decision = choose_scored_target(
+                            ["current", "candidate"],
+                            {"current": scale, "candidate": scale * (1 + gain / 100)},
+                            "current", None, 0, improvement_percent=percent,
+                            confirmations=1, switch_cost_seconds=0, decision_horizon_seconds=3600,
+                        )
+                        self.assertEqual(decision.target, "candidate" if passes else "current")
+                        self.assertIn(f"{percent:g}% improvement requirement", decision.reason)
+
+    def test_percentage_requirement_is_applied_after_switch_cost(self) -> None:
+        for scale in (0.000001, 0.01, 10.0):
+            for raw, passes in ((scale * 1.25, False), (scale * 1.25 / (11 / 12), True)):
+                with self.subTest(scale=scale, raw=raw):
+                    decision = choose_scored_target(
+                        ["current", "candidate"], {"current": scale, "candidate": raw},
+                        "current", None, 0, improvement_percent=25,
+                        confirmations=1, switch_cost_seconds=300, decision_horizon_seconds=3600,
+                    )
+                    self.assertEqual(decision.target, "candidate" if passes else "current")
+                    self.assertIn("after switch cost", decision.reason)
+
+    def test_equal_scores_keep_current_even_when_an_earlier_model_wins_tie_order(self) -> None:
+        for score in (0.0, 0.01, 1.0):
+            for percent in (0, 25):
+                with self.subTest(score=score, percent=percent):
+                    decision = choose_scored_target(
+                        ["candidate", "current"], {"candidate": score, "current": score},
+                        "current", "candidate", 2, improvement_percent=percent,
+                        confirmations=3, switch_cost_seconds=0, decision_horizon_seconds=3600,
+                    )
+                    self.assertEqual(decision.target, "current")
+                    self.assertIsNone(decision.challenger)
+                    self.assertEqual(decision.challenger_streak, 0)
+
+    def test_positive_score_can_replace_zero_only_after_consecutive_checks(self) -> None:
+        previous, streak = None, 0
+        for check in range(1, 4):
+            decision = choose_scored_target(
+                ["current", "candidate"], {"current": 0, "candidate": 0.000001},
+                "current", previous, streak, improvement_percent=25,
+                confirmations=3, switch_cost_seconds=300, decision_horizon_seconds=3600,
+            )
+            self.assertEqual(decision.target, "candidate" if check == 3 else "current")
+            self.assertIn("positive score above a zero current score", decision.reason)
+            self.assertNotIn("inf%", decision.reason)
+            previous, streak = decision.challenger, decision.challenger_streak
+
+    def test_percentage_failure_breaks_consecutive_streak(self) -> None:
+        decision = choose_scored_target(
+            ["current", "candidate"], {"current": 0.01, "candidate": 0.0124},
+            "current", "candidate", 2, improvement_percent=25,
+            confirmations=3, switch_cost_seconds=0, decision_horizon_seconds=3600,
+        )
+        self.assertEqual(decision.challenger_streak, 0)
+        next_check = choose_scored_target(
+            ["current", "candidate"], {"current": 0.01, "candidate": 0.013},
+            "current", decision.challenger, decision.challenger_streak, improvement_percent=25,
+            confirmations=3, switch_cost_seconds=0, decision_horizon_seconds=3600,
+        )
+        self.assertEqual(next_check.target, "current")
+        self.assertEqual(next_check.challenger_streak, 1)
+
     def test_initial_choice_uses_highest_blended_score_not_pressure(self) -> None:
         pressures = {"q35": 0.101, "q36": 0.054, "gemma": 0.384, "gpt": 0.629}
         scores = revenue_scores(
@@ -385,8 +471,7 @@ class ScoreDecisionTests(unittest.TestCase):
             None,
             None,
             0,
-            relative_margin=0.25,
-            absolute_margin=0.01,
+            improvement_percent=25,
             confirmations=2,
             switch_cost_seconds=300,
             decision_horizon_seconds=3600,
@@ -400,8 +485,7 @@ class ScoreDecisionTests(unittest.TestCase):
             "gemma",
             None,
             0,
-            relative_margin=0.25,
-            absolute_margin=0.10,
+            improvement_percent=25,
             confirmations=2,
             switch_cost_seconds=300,
             decision_horizon_seconds=3600,
@@ -416,8 +500,7 @@ class ScoreDecisionTests(unittest.TestCase):
             "gemma",
             first.challenger,
             first.challenger_streak,
-            relative_margin=0.25,
-            absolute_margin=0.10,
+            improvement_percent=25,
             confirmations=2,
             switch_cost_seconds=300,
             decision_horizon_seconds=3600,
@@ -432,14 +515,13 @@ class ScoreDecisionTests(unittest.TestCase):
             "gemma",
             None,
             0,
-            relative_margin=0.0,
-            absolute_margin=0.10,
+            improvement_percent=25,
             confirmations=1,
             switch_cost_seconds=300,
             decision_horizon_seconds=3600,
         )
         self.assertEqual(decision.target, "gemma")
-        self.assertIn("does not meet both score requirements", decision.reason)
+        self.assertIn("does not meet the 25% improvement requirement", decision.reason)
         self.assertEqual(decision.challenger, "gpt")
         self.assertEqual(decision.challenger_streak, 0)
 
@@ -529,7 +611,7 @@ class RuntimeForecastTests(unittest.TestCase):
             "gemma",
             Decision(
                 "gemma",
-                "q36 meets both score requirements; 1/3 consecutive checks passed",
+                "q36 meets the 25% improvement requirement; 1/3 consecutive checks passed",
                 challenger="q36",
                 challenger_streak=1,
             ),
@@ -542,14 +624,14 @@ class RuntimeForecastTests(unittest.TestCase):
         )
         assert forecast is not None
         self.assertIn("about 29 minutes", forecast)
-        self.assertIn("keeps meeting both score requirements", forecast)
+        self.assertIn("keeps meeting the percentage requirement", forecast)
 
     def test_margin_failing_contender_has_no_false_countdown(self) -> None:
         forecast = switch_forecast(
             "gemma",
             Decision(
                 "gemma",
-                "q36 does not meet both score requirements",
+                "q36 does not meet the 25% improvement requirement",
                 challenger="q36",
             ),
             {"last_switch_at": 1_000},
@@ -561,7 +643,7 @@ class RuntimeForecastTests(unittest.TestCase):
         )
         assert forecast is not None
         self.assertIn("no estimate yet", forecast)
-        self.assertIn("does not meet both score requirements", forecast)
+        self.assertIn("does not meet the required percentage improvement", forecast)
 
 
 class DaemonStateTests(unittest.TestCase):
@@ -886,6 +968,34 @@ class CliAndStateTests(unittest.TestCase):
                 main()
         self.assertFalse(self.state_path.exists())
 
+    def test_percentage_flag_uses_percent_and_legacy_flag_preserves_fraction_units(self) -> None:
+        parser = build_parser()
+        self.assertEqual(parser.parse_args([]).switch_improvement_percent, 25)
+        for percent in (0, 0.25, 1, 25, 200):
+            with self.subTest(percent=percent):
+                new = parser.parse_args(["--switch-improvement-percent", str(percent)])
+                old = parser.parse_args(["--relative-margin", str(percent / 100)])
+                self.assertEqual(new.switch_improvement_percent, percent)
+                self.assertAlmostEqual(old.switch_improvement_percent, percent)
+                self.assertFalse(hasattr(new, "absolute_margin"))
+
+    def test_invalid_or_ambiguous_margin_flags_stop_before_external_io(self) -> None:
+        commands = [
+            ["--switch-improvement-percent", value] for value in ("-1", "nan", "inf", "bad")
+        ] + [
+            ["--relative-margin", "1e308"],
+            ["--relative-margin", "0.25", "--switch-improvement-percent", "25"],
+            ["--absolute-margin", "0.01"],
+        ]
+        for flags in commands:
+            with self.subTest(flags=flags), patch.object(sys, "argv", ["warm_model_manager.py", *flags]), \
+                    patch("sys.stderr", new=io.StringIO()) as error_text, self.assertRaises(SystemExit) as error:
+                main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(self.state_path.exists())
+            if flags[0] == "--absolute-margin":
+                self.assertIn("use --switch-improvement-percent 25 for 25% (or 1 for 1%)", error_text.getvalue())
+
     def test_default_filename_does_not_depend_on_major_release(self) -> None:
         for version in ("5.0.0", "6.0.0"):
             with self.subTest(version=version), patch("warm_model_manager.MANAGER_VERSION", version):
@@ -1041,6 +1151,55 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.assertIn("\n\nHighest raw score:", report)
                 self.assertIn("85% input price + 15% output price", report)
                 self.assertNotIn("PROJ$/M", report)
+
+    def test_small_scores_can_switch_on_percentage_gain_in_live_and_dry_run(self) -> None:
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=1.4)
+        self.prices.return_value = ({"good": ModelPrice(0.005, 0.005), "candidate": ModelPrice(0.005, 0.005)}, ModelPrice(0.05, 0.2))
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.path.unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.args.apply = apply
+                self.manager = Manager(self.args)
+                for index in range(3):
+                    state, report = self.tick(10000 + index * 60)
+                    if index < 2:
+                        self.assertEqual(state["last_decision_target"], "good")
+                        self.launch.assert_not_called()
+                self.assertEqual(state["last_decision_target"], "candidate")
+                self.assertIn("28.33% improvement", report)
+                self.assertIn("at least 25% score improvement after switch cost", report)
+                self.assertNotIn("both score requirements", report)
+                self.assertEqual(state["switch_policy"]["improvement_percent"], 25)
+                if apply:
+                    self.launch.assert_called_once_with("darkbloom", "candidate", None, {IGNORED})
+                else:
+                    self.launch.assert_not_called()
+                    self.assertIn("WOULD SWITCH", report)
+
+    def test_percentage_rule_upgrade_rechecks_counts_and_preserves_history_and_warmup(self) -> None:
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=100)
+        state, _ = self.tick()
+        state.pop("switch_policy")
+        state.update(manager_version="0.1.5", live_challenger_model="candidate", live_challenger_streak=2,
+                     dry_challenger_model="candidate", dry_challenger_streak=2, last_switch_at=5000)
+        self.save(state)
+        upgraded, report = self.tick(10060)
+        self.assertEqual(upgraded["live_challenger_streak"], 1)
+        self.assertEqual(upgraded.get("dry_challenger_streak", 0), 0)
+        self.assertEqual(len(upgraded["pressure_history"]["good"]), 2)
+        self.assertEqual(upgraded["last_switch_at"], 5000)
+        self.launch.assert_not_called()
+        pending = {"target": "candidate", "warm_models": ["candidate"], "command_at": 10060}
+        state["pending_switch"] = pending
+        self.save(state)
+        upgraded, report = self.tick(10120)
+        self.assertEqual(upgraded["pending_switch"], pending)
+        self.assertEqual(upgraded["last_switch_at"], 5000)
+        self.assertIn("WARMING", report)
+        self.launch.assert_not_called()
 
     def test_missing_component_blocks_candidate_or_current_in_live_and_dry_run(self) -> None:
         self.local.return_value = {"good", "candidate"}

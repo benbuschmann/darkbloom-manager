@@ -36,7 +36,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.5"
+MANAGER_VERSION = "0.1.6"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -72,7 +72,7 @@ MANAGER_STATE_KEYS = {
     "last_decision_at", "last_decision_reason", "last_decision_target",
     "last_score_snapshot", "last_switch_at", "manager_version",
     "pending_switch", "preload_sync_schema", "pressure_cadence", "pressure_history",
-    "pricing_cache", "pricing_status", "scoring_policy", "selection_policy", "state_schema",
+    "pricing_cache", "pricing_status", "scoring_policy", "selection_policy", "switch_policy", "state_schema",
     "live_challenger_model", "live_challenger_streak",
     "dry_challenger_model", "dry_challenger_streak",
 }
@@ -351,6 +351,27 @@ def ensure_scoring_policy(manager_state: dict[str, Any]) -> bool:
     return True
 
 
+def ensure_switch_policy(
+    manager_state: dict[str, Any],
+    improvement_percent: float,
+    switch_cost_seconds: float,
+    decision_horizon_seconds: float,
+) -> bool:
+    """Count consecutive passes only under the same percentage and cost rule."""
+    desired = {
+        "improvement_percent": improvement_percent,
+        "switch_cost_seconds": switch_cost_seconds,
+        "decision_horizon_seconds": decision_horizon_seconds,
+    }
+    if manager_state.get("switch_policy") == desired:
+        return False
+    for apply in (False, True):
+        for key in challenger_state_keys(apply):
+            manager_state.pop(key, None)
+    manager_state["switch_policy"] = desired
+    return True
+
+
 def revenue_scores(
     pressures: dict[str, float],
     weights: dict[str, float],
@@ -445,8 +466,7 @@ def choose_scored_target(
     current_model: str | None,
     previous_challenger: str | None,
     previous_streak: int,
-    relative_margin: float,
-    absolute_margin: float,
+    improvement_percent: float,
     confirmations: int,
     switch_cost_seconds: float,
     decision_horizon_seconds: float,
@@ -473,22 +493,28 @@ def choose_scored_target(
         available,
         key=lambda model: (adjusted[model], -priority_index[model]),
     )
-    if challenger == current_model:
-        return Decision(
-            current_model,
-            f"current model ranks first among models allowed to load after switch cost ({scores[current_model]:.3f})",
-        )
-
     current_score = scores[current_model]
     challenger_score = adjusted[challenger]
-    relative_floor = current_score * (1.0 + relative_margin)
-    absolute_floor = current_score + absolute_margin
-    if challenger_score < relative_floor or challenger_score < absolute_floor:
+    # A percentage of zero is zero. Require a strict gain to avoid switching
+    # between zero-score models or equal scores when the requirement is 0%.
+    if challenger == current_model or challenger_score <= current_score:
         return Decision(
             current_model,
-            f"{challenger} does not meet both score requirements after switch cost "
-            f"({challenger_score:.3f} vs current {current_score:.3f}; "
-            f"need >= {relative_floor:.3f} and >= {absolute_floor:.3f})",
+            f"no allowed model scores higher after switch cost (current {current_score:.6g})",
+        )
+
+    required_score = current_score * (1.0 + improvement_percent / 100.0)
+    comparison = f"{challenger_score:.6g} after switch cost vs current {current_score:.6g}"
+    gain = (
+        f"{(challenger_score / current_score - 1.0) * 100.0:.2f}% improvement"
+        if current_score > 0 else "positive score above a zero current score"
+    )
+    requirement = f"{improvement_percent:g}% improvement requirement (--switch-improvement-percent)"
+    if challenger_score < required_score and not math.isclose(challenger_score, required_score, rel_tol=1e-12, abs_tol=0.0):
+        return Decision(
+            current_model,
+            f"{challenger} does not meet the {requirement} "
+            f"({gain}; {comparison}; need >= {required_score:.6g})",
             challenger=challenger,
         )
 
@@ -496,15 +522,15 @@ def choose_scored_target(
     if streak < confirmations:
         return Decision(
             current_model,
-            f"{challenger} meets both score requirements; "
+            f"{challenger} meets the {requirement} ({gain}); "
             f"{streak}/{confirmations} consecutive checks passed (--switch-after-checks)",
             challenger=challenger,
             challenger_streak=streak,
         )
     return Decision(
         challenger,
-        f"{challenger} met both score requirements for {streak} consecutive checks "
-        f"({challenger_score:.3f} after switch cost vs current {current_score:.3f}; --switch-after-checks)",
+        f"{challenger} met the {requirement} for {streak} consecutive checks "
+        f"({gain}; {comparison}; --switch-after-checks)",
         challenger=challenger,
         challenger_streak=streak,
     )
@@ -1104,7 +1130,7 @@ def switch_forecast(
     if decision.target == current and decision.challenger_streak <= 0:
         return (
             f"no estimate yet; {display_name(contender)} "
-            "does not meet both score requirements"
+            "does not meet the required percentage improvement after switch cost"
         )
 
     remaining_checks = 0
@@ -1123,7 +1149,7 @@ def switch_forecast(
         wait = math.ceil(wait / interval_seconds) * interval_seconds
 
     condition = (
-        f"if {display_name(contender)} keeps meeting both score requirements and the provider is idle"
+        f"if {display_name(contender)} keeps meeting the percentage requirement and the provider is idle"
     )
     if wait <= 0:
         if daemon and daemon.inference_active:
@@ -1158,6 +1184,7 @@ def print_report(
     ignored_models: set[str],
     eligible_models: list[str],
     blocked: str | None,
+    improvement_percent: float,
 ) -> None:
     timestamp = datetime.fromtimestamp(now).astimezone().strftime(
         "%Y-%m-%d %H:%M:%S %Z"
@@ -1263,6 +1290,7 @@ def print_report(
     else:
         action = "KEEP"
     print(f"Decision:  {action} → {display_name(decision.target)}", flush=True)
+    print(f"Switch rule: at least {improvement_percent:g}% score improvement after switch cost (--switch-improvement-percent).", flush=True)
     if decision.challenger and decision.target == current:
         progress = (
             f" — {decision.challenger_streak}/{confirmations} consecutive checks passed (--switch-after-checks)"
@@ -1378,12 +1406,18 @@ class Manager:
         )
         discarded_legacy_pending = ensure_preload_sync_policy(manager_state)
         scoring_changed = ensure_scoring_policy(manager_state)
+        switch_rule_changed = ensure_switch_policy(
+            manager_state, self.args.switch_improvement_percent,
+            self.args.switch_cost, self.args.decision_horizon,
+        )
         if migrated_history:
             log("initialized timestamped pressure samples")
         elif cadence_changed:
             log("saved pressure samples and consecutive check counts reset because --check-every or --average-samples changed")
         if scoring_changed and not migrated_history:
             log("scoring formula changed; consecutive passing checks reset")
+        if switch_rule_changed and not migrated_history:
+            log("percentage or switch-cost rule changed; consecutive passing checks reset")
         if discarded_legacy_pending:
             log(
                 "discarded a legacy pending switch so startup preload can be "
@@ -1490,8 +1524,7 @@ class Manager:
                     else None
                 ),
                 int(manager_state.get(challenger_streak_key) or 0),
-                self.args.relative_margin,
-                self.args.absolute_margin,
+                self.args.switch_improvement_percent,
                 self.args.switch_after_checks,
                 self.args.switch_cost,
                 self.args.decision_horizon,
@@ -1541,6 +1574,7 @@ class Manager:
             self.ignored,
             eligible_models,
             blocked,
+            self.args.switch_improvement_percent,
         )
         selection_matches = warm_selection_matches(
             daemon,
@@ -1641,6 +1675,19 @@ def parse_weight(value: str) -> tuple[str, float]:
     return model, weight
 
 
+def legacy_margin_percent(value: str) -> float:
+    percent = nonnegative_float(value) * 100.0
+    if not math.isfinite(percent):
+        raise argparse.ArgumentTypeError("percentage must be finite")
+    return percent
+
+
+def removed_absolute_margin(value: str) -> None:
+    raise argparse.ArgumentTypeError(
+        "fixed score margins were removed; use --switch-improvement-percent 25 for 25% (or 1 for 1%)"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1665,9 +1712,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--check-every", "--interval", type=int, default=60, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 60)")
     parser.add_argument("--average-samples", "--history", type=int, default=15, metavar="COUNT", help="average up to this many recent pressure samples (default 15)")
-    parser.add_argument("--relative-margin", type=nonnegative_float, default=0.25, help="required score increase after switch cost, as a fraction of the current score (default 0.25)")
-    parser.add_argument("--absolute-margin", type=nonnegative_float, default=0.01, help="required additional score after switch cost (default 0.01)")
-    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=3, metavar="COUNT", help="require this many consecutive checks meeting both score requirements (default 3)")
+    improvement = parser.add_mutually_exclusive_group()
+    improvement.add_argument("--switch-improvement-percent", type=nonnegative_float, default=25.0, metavar="PERCENT", help="required score improvement after switch cost; 25 means 25%% (default 25)")
+    improvement.add_argument("--relative-margin", dest="switch_improvement_percent", type=legacy_margin_percent, default=argparse.SUPPRESS, metavar="FRACTION", help="legacy form of --switch-improvement-percent: 0.25 means 25%%; use only one form")
+    parser.add_argument("--absolute-margin", type=removed_absolute_margin, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--switch-after-checks", "--confirmations", type=int, default=3, metavar="COUNT", help="require this many consecutive checks meeting the percentage improvement requirement (default 3)")
     parser.add_argument("--min-warm-time", "--min-dwell", type=int, default=2700, metavar="SECONDS", help="keep the current model warm at least this long before switching (default 2700)")
     parser.add_argument("--warmup-timeout", type=positive_float, default=180, help="seconds to wait for the requested model to become warm before reporting loading as overdue (default 180)")
     parser.add_argument("--switch-cost", type=nonnegative_float, default=300, help="estimated unavailable seconds per switch (default 300)")
