@@ -17,11 +17,13 @@ from warm_model_manager import (
     Decision,
     LocalDaemonState,
     MANAGER_VERSION,
+    ModelPrice,
+    PRICING_CACHE_SCHEMA,
     STATE_SCHEMA,
     Manager,
     build_score_snapshot,
     build_parser,
-    cached_output_prices,
+    cached_model_prices,
     catalog_model_ids,
     challenger_state_keys,
     choose_scored_target,
@@ -30,8 +32,9 @@ from warm_model_manager import (
     dwell_anchor,
     ensure_pressure_cadence,
     ensure_preload_sync_policy,
+    ensure_scoring_policy,
     eligible_local_targets,
-    fetch_output_prices,
+    fetch_model_prices,
     format_duration,
     format_human_duration,
     local_model_ids,
@@ -65,7 +68,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.3")
+        self.assertEqual(MANAGER_VERSION, "0.1.4")
 
     def test_default_qwen_preference_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -169,12 +172,13 @@ class CapacityTests(unittest.TestCase):
 
     def test_revenue_score_combines_pressure_price_and_preference(self) -> None:
         scores = revenue_scores(
-            {"q35": 0.5, "gpt": 0.5},
-            {"q35": 1.15, "gpt": 1.0},
-            {"q35": 0.75, "gpt": 0.10},
+            {"q35": 0.5, "gpt": 0.5, "q9": 2.0},
+            {"q35": 1.25, "gpt": 1.0},
+            {"q35": ModelPrice(0.08, 0.75), "gpt": ModelPrice(0.02, 0.10), "q9": ModelPrice(0.08, 0.13)},
         )
-        self.assertAlmostEqual(scores["q35"], 0.43125)
-        self.assertAlmostEqual(scores["gpt"], 0.05)
+        self.assertAlmostEqual(scores["q35"], 0.1128125)
+        self.assertAlmostEqual(scores["gpt"], 0.016)
+        self.assertAlmostEqual(scores["q9"], 0.175)
 
     def test_score_snapshot_records_every_input_to_the_decision_score(self) -> None:
         samples = {"q35": CapacitySample("q35", 10, 4, 0.4)}
@@ -189,50 +193,160 @@ class CapacityTests(unittest.TestCase):
             samples,
             {"q35": 0.3},
             history,
-            {"q35": 0.75},
+            {"q35": ModelPrice(0.08, 0.75)},
             {"q35": 1.15},
-            {"q35": 0.25875},
+            {"q35": 0.0622725},
             observed_at=160.0,
             window_seconds=180.0,
         )
         self.assertEqual(snapshot["observed_at"], 160.0)
         self.assertEqual(snapshot["window_seconds"], 180.0)
+        self.assertEqual(snapshot["input_token_share"], 0.85)
+        self.assertEqual(snapshot["output_token_share"], 0.15)
         values = snapshot["models"]["q35"]
         self.assertEqual(values["now_pressure"], 0.4)
         self.assertEqual(values["average_pressure"], 0.3)
         self.assertEqual(values["retained_samples"], 2)
+        self.assertEqual(values["input_usd_per_million"], 0.08)
         self.assertEqual(values["output_usd_per_million"], 0.75)
-        self.assertAlmostEqual(values["projected_usd_per_million"], 0.225)
+        self.assertAlmostEqual(values["blended_usd_per_million"], 0.1805)
         self.assertEqual(values["preference"], 1.15)
-        self.assertEqual(values["score"], 0.25875)
+        self.assertEqual(values["score"], 0.0622725)
 
     def test_public_micro_usd_prices_convert_to_usd_per_million(self) -> None:
         payload = {
+            "fallback_input_price": 50_000,
             "fallback_output_price": 200_000,
             "prices": [
-                {"model": "q35", "output_price": 750_000},
-                {"model": "gpt", "output_price": 100_000},
+                {"model": "q35", "input_price": 80_000, "output_price": 750_000},
+                {"model": "gpt", "input_price": 20_000, "output_price": 100_000},
             ],
         }
         with patch("warm_model_manager.get_json", return_value=payload):
-            prices, fallback = fetch_output_prices("https://example.test/pricing")
-        self.assertEqual(prices, {"q35": 0.75, "gpt": 0.10})
-        self.assertEqual(fallback, 0.20)
+            prices, fallback = fetch_model_prices("https://example.test/pricing")
+        self.assertEqual(prices, {"q35": ModelPrice(0.08, 0.75), "gpt": ModelPrice(0.02, 0.10)})
+        self.assertEqual(fallback, ModelPrice(0.05, 0.20))
 
     def test_cached_prices_cover_missing_model_with_public_fallback(self) -> None:
         state = {}
         with patch(
-            "warm_model_manager.fetch_output_prices",
-            return_value=({"q35": 0.75}, 0.20),
+            "warm_model_manager.fetch_model_prices",
+            return_value=({"q35": ModelPrice(0.08, 0.75)}, ModelPrice(0.05, 0.20)),
         ):
-            prices = cached_output_prices(
+            prices = cached_model_prices(
                 state,
                 ["q35", "new-model"],
                 "https://example.test/pricing",
                 now=1000,
                 refresh_seconds=900,
             )
-        self.assertEqual(prices, {"q35": 0.75, "new-model": 0.20})
+        self.assertEqual(prices, {"q35": ModelPrice(0.08, 0.75), "new-model": ModelPrice(0.05, 0.20)})
+
+    def test_supported_model_blends_use_the_same_fixed_token_mix(self) -> None:
+        cases = [
+            ("qwen3.5-35b-a3b", 0.08, 0.75, 0.1805, 0.225625),
+            ("qwen3.6-35b-a3b-vl-mtp-mxfp8", 0.05, 0.70, 0.1475, 0.177),
+            ("gemma-4-26b-qat-4bit", 0.042, 0.22, 0.0687, 0.072135),
+            ("gemma-4-26b", 0.042, 0.22, 0.0687, 0.0687),
+            ("gemma-4-26b-8bit", 0.042, 0.22, 0.0687, 0.0687),
+            ("gpt-oss-20b", 0.02, 0.10, 0.032, 0.032),
+            ("Qwen3.5-9B", 0.08, 0.13, 0.0875, 0.0875),
+            ("qwen3-vl-30b-a3b-instruct", 0.09, 0.40, 0.1365, 0.1365),
+            ("EigenLabs/Qwen3.8-27B-4bit-mtp", 0.15, 2.0, 0.4275, 0.4275),
+        ]
+        for model, input_price, output_price, blend, score in cases:
+            with self.subTest(model=model):
+                price = ModelPrice(input_price, output_price)
+                self.assertAlmostEqual(price.blended_usd, blend)
+                self.assertAlmostEqual(revenue_scores({model: 1}, DEFAULT_WEIGHTS, {model: price})[model], score)
+
+    def test_missing_or_invalid_price_components_cannot_be_scored(self) -> None:
+        for field in ("input_price", "output_price"):
+            for invalid in (None, -1, "bad", float("nan"), float("inf"), True):
+                with self.subTest(field=field, value=invalid):
+                    payload = {
+                        "prices": [{"model": "partial", "input_price": 80_000, "output_price": 130_000, field: invalid}],
+                        "fallback_input_price": 50_000, "fallback_output_price": 200_000,
+                    }
+                    with patch("warm_model_manager.get_json", return_value=payload):
+                        prices = cached_model_prices({}, ["partial", "unlisted"], "https://example.test/pricing", 1000, 900)
+                    self.assertIsNone(prices["partial"].blended_usd)
+                    self.assertEqual(set(revenue_scores({"partial": 100, "unlisted": 1}, {}, prices)), {"unlisted"})
+
+    def test_explicit_zero_component_is_valid_but_all_zero_is_not_scored(self) -> None:
+        payload = {"prices": [
+            {"model": "free-input", "input_price": 0, "output_price": 200_000},
+            {"model": "free-output", "input_price": 100_000, "output_price": 0},
+            {"model": "free", "input_price": 0, "output_price": 0},
+            {"model": "missing-input", "output_price": 200_000},
+        ]}
+        with patch("warm_model_manager.get_json", return_value=payload):
+            prices, fallback = fetch_model_prices("https://example.test/pricing")
+        scores = revenue_scores(dict.fromkeys(prices, 1), {}, prices)
+        self.assertEqual(set(scores), {"free-input", "free-output"})
+        self.assertAlmostEqual(scores["free-input"], 0.03)
+        self.assertAlmostEqual(scores["free-output"], 0.085)
+        self.assertIsNone(fallback.blended_usd)
+
+    def test_both_prices_and_fallback_survive_cache_roundtrip_and_outage(self) -> None:
+        state = {}
+        url = "https://example.test/pricing"
+        expected = {"q9": ModelPrice(0.08, 0.13), "new": ModelPrice(0.05, 0.20)}
+        with patch("warm_model_manager.fetch_model_prices", return_value=({"q9": expected["q9"]}, expected["new"])):
+            self.assertEqual(cached_model_prices(state, list(expected), url, 1000, 900), expected)
+        state = json.loads(json.dumps(state))
+        self.assertEqual(state["pricing_cache"]["schema"], PRICING_CACHE_SCHEMA)
+        with patch("warm_model_manager.fetch_model_prices", side_effect=RuntimeError("offline")) as fetch:
+            self.assertEqual(cached_model_prices(state, list(expected), url, 1060, 900), expected)
+            fetch.assert_not_called()
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(cached_model_prices(state, list(expected), url, 2000, 900), expected)
+            fetch.assert_called_once()
+        self.assertEqual(state["pricing_status"]["status"], "stale cache")
+        self.assertEqual(state["pricing_status"]["fetched_at"], 1000)
+
+    def test_output_only_cache_requires_fresh_input_prices_even_during_outage(self) -> None:
+        url = "https://example.test/pricing"
+        for offline in (False, True):
+            with self.subTest(offline=offline):
+                state = {"pricing_cache": {"source": url, "fetched_at": 1000,
+                         "prices": {"q9": 0.13}, "fallback_output_usd": 0.2}}
+                with patch("warm_model_manager.fetch_model_prices", return_value=({"q9": ModelPrice(0.08, 0.13)}, ModelPrice(0.05, 0.2)),
+                           side_effect=RuntimeError("offline") if offline else None) as fetch, redirect_stdout(io.StringIO()):
+                    prices = cached_model_prices(state, ["q9"], url, 1060, 900)
+                fetch.assert_called_once_with(url)
+                if offline:
+                    self.assertEqual(revenue_scores({"q9": 10}, {}, prices), {})
+                    self.assertEqual(state["pricing_status"]["status"], "unavailable")
+                    self.assertIsNone(state["pricing_status"]["fetched_at"])
+                    self.assertNotIn("pricing_cache", state)
+                else:
+                    self.assertAlmostEqual(prices["q9"].blended_usd, 0.0875)
+                    self.assertEqual(state["pricing_cache"]["schema"], PRICING_CACHE_SCHEMA)
+
+    def test_price_cache_does_not_cross_pricing_sources(self) -> None:
+        state = {}
+        with patch("warm_model_manager.fetch_model_prices", return_value=({}, ModelPrice(0.05, 0.2))):
+            cached_model_prices(state, ["new"], "https://first.test/pricing", 1000, 900)
+        with patch("warm_model_manager.fetch_model_prices", side_effect=RuntimeError("offline")), redirect_stdout(io.StringIO()):
+            prices = cached_model_prices(state, ["new"], "https://second.test/pricing", 1060, 900)
+        self.assertIsNone(prices["new"].blended_usd)
+        self.assertEqual(state["pricing_status"]["status"], "unavailable")
+
+    def test_formula_change_resets_counts_once_without_erasing_warmup_or_history(self) -> None:
+        preserved = {
+            "pressure_history": {"good": [{"at": 1000, "pressure": 1}]},
+            "pending_switch": {"target": "good", "warm_models": ["good"], "command_at": 1000},
+            "last_switch_at": 500, "active_target": "good",
+        }
+        state = {**preserved, "live_challenger_model": "next", "live_challenger_streak": 2,
+                 "dry_challenger_model": "next", "dry_challenger_streak": 2}
+        self.assertTrue(ensure_scoring_policy(state))
+        self.assertTrue(all(state[key] == value for key, value in preserved.items()))
+        self.assertFalse(any("challenger" in key for key in state))
+        state["live_challenger_streak"] = 1
+        self.assertFalse(ensure_scoring_policy(state))
+        self.assertEqual(state["live_challenger_streak"], 1)
 
     def test_duration_labels_match_test_and_production_intervals(self) -> None:
         self.assertEqual(format_duration(59.2), "60s")
@@ -257,12 +371,13 @@ class CapacityTests(unittest.TestCase):
 
 
 class ScoreDecisionTests(unittest.TestCase):
-    def test_initial_choice_uses_highest_projected_revenue_not_pressure(self) -> None:
+    def test_initial_choice_uses_highest_blended_score_not_pressure(self) -> None:
         pressures = {"q35": 0.101, "q36": 0.054, "gemma": 0.384, "gpt": 0.629}
         scores = revenue_scores(
             pressures,
             {"q35": 1.15, "q36": 1.10, "gemma": 1.05, "gpt": 1.0},
-            {"q35": 0.75, "q36": 0.70, "gemma": 0.22, "gpt": 0.10},
+            {"q35": ModelPrice(0.08, 0.75), "q36": ModelPrice(0.05, 0.70),
+             "gemma": ModelPrice(0.042, 0.22), "gpt": ModelPrice(0.02, 0.10)},
         )
         decision = choose_scored_target(
             MODELS,
@@ -838,7 +953,9 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.local = self.mock("local_model_ids", return_value={"good", IGNORED})
         self.catalog = self.mock("catalog_model_ids", return_value=set())
         self.capacity = self.mock("fetch_capacity", return_value=self.samples(good=1, **{IGNORED: 100}))
-        self.prices = self.mock("fetch_output_prices", return_value=({"good": 0.5, IGNORED: 0.75}, 0.2))
+        self.prices = self.mock("fetch_model_prices", return_value=(
+            {"good": ModelPrice(0.5, 0.5), IGNORED: ModelPrice(0.75, 0.75)}, ModelPrice(0.2, 0.2),
+        ))
         self.daemon = self.mock("read_daemon_state", return_value=LocalDaemonState(
             current_model="good", warm_models=("good",), inference_active=False,
             pid=123, started_at=100, fresh=True,
@@ -869,19 +986,121 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.path.write_text(json.dumps(state))
 
     def test_ignored_leader_has_all_math_persisted_but_is_never_selected(self) -> None:
+        self.prices.return_value[0][IGNORED] = ModelPrice(0.15, 2.0)
         state, report = self.tick()
         row = state["last_score_snapshot"]["models"][IGNORED]
         self.assertTrue(row["ignored"])
         self.assertFalse(row["eligible"])
         self.assertEqual(row["now_pressure"], 100)
         self.assertEqual(row["average_pressure"], 100)
-        self.assertEqual(row["output_usd_per_million"], 0.75)
+        self.assertEqual(row["input_usd_per_million"], 0.15)
+        self.assertEqual(row["output_usd_per_million"], 2.0)
+        self.assertAlmostEqual(row["blended_usd_per_million"], 0.4275)
         self.assertEqual(row["preference"], 1)
-        self.assertEqual(row["score"], 75)
+        self.assertAlmostEqual(row["score"], 42.75)
         self.assertEqual(state["pressure_history"][IGNORED], [{"at": 10000, "pressure": 100}])
         self.assertEqual(state["last_decision_target"], "good")
         self.assertIn(f"Highest raw score: {IGNORED} [IGNORED]", report)
         self.assertNotIn("WOULD SWITCH", report)
+        self.launch.assert_not_called()
+
+    def test_blended_winner_obeys_cost_margins_and_three_checks_in_live_and_dry_run(self) -> None:
+        q35, q9 = "qwen3.5-35b-a3b", "Qwen3.5-9B"
+        self.local.return_value = {q35, q9}
+        self.capacity.return_value = self.samples(**{q35: 1, q9: 4})
+        self.prices.return_value = ({q35: ModelPrice(0.08, 0.75), q9: ModelPrice(0.08, 0.13)}, ModelPrice(0.05, 0.20))
+        self.daemon.return_value = LocalDaemonState(q35, (q35,), False, 123, 100, True)
+        # Output-only pricing would prefer q35: 0.9375 versus q9's 0.52.
+        # The blend gives q9 0.35 (0.32083 after switch cost) versus 0.225625.
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                self.path.unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.args.apply = apply
+                self.manager = Manager(self.args)
+                for index in range(3):
+                    state, report = self.tick(10000 + index * 60)
+                    self.assertAlmostEqual(state["last_score_snapshot"]["models"][q9]["score"], 0.35)
+                    self.assertAlmostEqual(state["last_score_snapshot"]["models"][q35]["score"], 0.225625)
+                    if index < 2:
+                        self.assertEqual(state["last_decision_target"], q35)
+                        self.assertIn(f"{index + 1}/3 consecutive checks passed", report)
+                        self.launch.assert_not_called()
+                self.assertEqual(state["last_decision_target"], q9)
+                if apply:
+                    self.launch.assert_called_once_with("darkbloom", q9, None, {IGNORED})
+                    self.assertEqual(state["pending_switch"]["warm_models"], [q9])
+                else:
+                    self.launch.assert_not_called()
+                    self.assertIn("WOULD SWITCH", report)
+                header = next(line for line in report.splitlines() if line.startswith("MODEL ID"))
+                self.assertEqual(header.split(), ["MODEL", "ID", "NOW", "AVG", "5m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "PREF", "SCORE", "STATUS"])
+                q9_row = next(line for line in report.splitlines() if line.startswith("  " + q9))
+                self.assertEqual(q9_row.split()[4:9], ["0.0800", "0.1300", "0.0875", "1.00", "0.350"])
+                self.assertIn("\n" + "=" * len(header) + "\n", report)
+                self.assertIn("\n\nHighest raw score:", report)
+                self.assertIn("85% input price + 15% output price", report)
+                self.assertNotIn("PROJ$/M", report)
+
+    def test_missing_component_blocks_candidate_or_current_in_live_and_dry_run(self) -> None:
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=100)
+        for apply in (False, True):
+            for missing in ("good", "candidate"):
+                with self.subTest(apply=apply, missing=missing):
+                    self.path.unlink(missing_ok=True)
+                    self.args.apply = apply
+                    self.manager = Manager(self.args)
+                    prices = {"good": ModelPrice(0.08, 0.13), "candidate": ModelPrice(0.15, 2.0)}
+                    prices[missing] = ModelPrice(None, prices[missing].output_usd)
+                    self.prices.return_value = (prices, ModelPrice(0.05, 0.20))
+                    for index in range(4):
+                        state, report = self.tick(10000 + 60 * index)
+                        row = state["last_score_snapshot"]["models"][missing]
+                        self.assertIsNone(row["input_usd_per_million"])
+                        self.assertIsNotNone(row["output_usd_per_million"])
+                        self.assertIsNone(row["blended_usd_per_million"])
+                        self.assertIsNone(row["score"])
+                        self.assertFalse(row["eligible"])
+                        self.assertIn("input price unavailable", row["status"])
+                        self.assertEqual(state["last_decision_target"], None if missing == "good" else "good")
+                    self.launch.assert_not_called()
+
+    def test_upgrade_keeps_history_but_requires_new_passing_checks(self) -> None:
+        self.local.return_value = {"good", "candidate"}
+        state, _ = self.tick()
+        state.pop("scoring_policy")
+        state.update(live_challenger_model="candidate", live_challenger_streak=2,
+                     dry_challenger_model="candidate", dry_challenger_streak=2, last_switch_at=5000)
+        state["pricing_cache"] = {"source": self.args.pricing_url, "fetched_at": 10000,
+                                  "prices": {"good": 0.5, "candidate": 0.2}, "fallback_output_usd": 0.2}
+        self.save(state)
+        self.capacity.return_value = self.samples(good=1, candidate=100)
+        self.manager = Manager(self.args)
+        for index in (1, 2):
+            state, report = self.tick(10000 + 60 * index)
+            self.assertEqual(state["live_challenger_streak"], index)
+            self.assertEqual(state.get("dry_challenger_streak", 0), 0)
+            self.assertEqual(state["last_decision_target"], "good")
+            self.assertEqual(len(state["pressure_history"]["good"]), index + 1)
+            self.assertEqual(state["last_switch_at"], 5000)
+            self.launch.assert_not_called()
+        self.assertEqual(state["state_schema"], STATE_SCHEMA)
+        self.assertEqual(self.prices.call_count, 2)
+        self.assertEqual(state["pricing_cache"]["schema"], PRICING_CACHE_SCHEMA)
+
+    def test_formula_upgrade_preserves_an_already_issued_pending_launch(self) -> None:
+        state, _ = self.tick()
+        state.pop("scoring_policy")
+        pending = {"target": "good", "warm_models": ["good"], "command_at": 10000}
+        state.update(pending_switch=pending, last_switch_at=5000)
+        self.save(state)
+        self.daemon.return_value = LocalDaemonState(None, (), False, 124, 10000, True)
+        state, report = self.tick(10060)
+        self.assertEqual(state["pending_switch"], pending)
+        self.assertEqual(state["last_switch_at"], 5000)
+        self.assertEqual(len(state["pressure_history"]["good"]), 2)
+        self.assertIn("WARMING", report)
         self.launch.assert_not_called()
 
     def test_catalog_models_without_downloads_are_scored_but_never_selected(self) -> None:
@@ -1093,16 +1312,16 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertIsNone(row["score"])
         self.assertIsNone(row["output_usd_per_million"])
         self.assertIn("N/A", report)
-        self.assertIn("IGNORED; capacity unavailable; price unavailable", report)
+        self.assertIn("IGNORED; capacity unavailable; input price unavailable; output price unavailable", report)
         self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 
     def test_missing_price_for_ignored_model_does_not_block_eligible_model(self) -> None:
-        self.prices.return_value = ({"good": 0.5}, 0)
+        self.prices.return_value = ({"good": ModelPrice(0.5, 0.5)}, ModelPrice(None, None))
         state, report = self.tick()
         self.assertEqual(state["last_decision_target"], "good")
         self.assertIsNone(state["last_score_snapshot"]["models"][IGNORED]["score"])
-        self.assertIn("IGNORED; price unavailable", report)
+        self.assertIn("IGNORED; input price unavailable; output price unavailable", report)
 
     def test_stale_pricing_cache_is_identified(self) -> None:
         self.tick()

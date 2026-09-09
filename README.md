@@ -1,7 +1,7 @@
 # Darkbloom warm-model manager
 
 Keeps one downloaded model warm on a running Darkbloom provider. The manager
-compares public network pressure and output prices, waits for a sustained score
+compares public network pressure and input/output prices, waits for a sustained score
 advantage, then switches when the provider is idle.
 
 ## Install
@@ -85,12 +85,32 @@ number of consecutive passing checks.
 
 ```text
 pressure = active requests / max(1, warm providers)
-projected value = average pressure × output price per million tokens
-score = projected value × preference weight
+blended price = (input price × 0.85) + (output price × 0.15)
+score = average pressure × blended price × preference weight
 ```
 
-The score assumes equal output speed across models. It does not measure your
-provider's payout or throughput.
+Prices are USD per million tokens. Every model uses the same fixed mix:
+85% input tokens and 15% output tokens. The mix is built into the script.
+Prices still refresh from Darkbloom's public endpoint.
+
+For example, an input price of `$0.08/M` and an output price of `$0.13/M`
+give a blended price of `$0.0875/M` total tokens. At average pressure `2.0`
+and preference `1.00`, the score is `0.175`.
+
+The score compares models at that assumed mix. It does not measure your
+provider's throughput, actual token mix, or payouts, and does not reproduce
+per-request billing rounding.
+
+| Table column | Meaning |
+| --- | --- |
+| `IN$/M` | Input price per million input tokens. |
+| `OUT$/M` | Output price per million output tokens. |
+| `BLEND$/M` | Price per million total tokens at the fixed 85/15 mix, before pressure and preference. |
+| `PREF` | Your model preference weight. |
+| `SCORE` | Average pressure × blended price × preference. |
+
+Price columns show four decimal places. Calculations use the full values.
+`BLEND$/M` replaces the earlier `PROJ$/M` column.
 
 | Model ID | Default weight |
 | --- | ---: |
@@ -108,6 +128,10 @@ score by `(decision-horizon − switch-cost) / decision-horizon`. It then checks
 both score requirements. With the defaults, a current score of `0.10` and a
 candidate score of `0.12` produce an adjusted candidate score of `0.11`. That misses the required
 `0.125`, so that check does not count toward `--switch-after-checks`.
+
+The switch thresholds remain 25% and `0.01`. Blended scores are usually smaller
+than output-only scores, so the `0.01` absolute requirement can be relatively
+stricter. Both requirements still have to pass.
 
 | Flag | Default | What it controls |
 | --- | --- | --- |
@@ -153,7 +177,7 @@ unless placed earlier by `--model`. Each launch still requests one model.
 Use `--ignore-model MODEL_ID`, or `--ignore MODEL_ID`, to exclude a model from
 loading. The flag is repeatable and matches exact, case-sensitive IDs. Ignored
 models stay in the table, even when they are absent from the local list. Their
-rows show `IGNORED` alongside pressure, average, price, preference, and score.
+rows show `IGNORED` alongside pressure, average, both prices, blend, preference, and score.
 Their calculations are saved too. An explicit ignore stays in effect even if
 you download the model later.
 
@@ -202,14 +226,14 @@ write permissions.
 | Saved data | Purpose |
 | --- | --- |
 | Timestamped pressure samples | Rebuild each model's rolling average after a restart. |
-| Latest score snapshot | Retain pressure, average, price, weight, score, local availability, and explicit or automatic ignore reasons. |
-| Price cache and fetch time | Reuse prices between refreshes and identify stale prices. |
+| Latest score snapshot | Retain pressure, average, input/output prices, blended price, token mix, weight, score, local availability, and explicit or automatic ignore reasons. |
+| Price cache and fetch time | Reuse both prices and public fallback prices between refreshes and identify stale prices. |
 | Discovered model IDs, scan times, and scan errors | Show the last inventory when discovery fails. |
 | Catalog IDs, source, fetch time, and errors | Keep catalog rows visible during an outage and identify stale catalog data. |
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
 | Candidate and count of consecutive passing checks | Resume progress toward `--switch-after-checks` across restarts. Live and dry-run counts are separate. |
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
-| Last decision, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
+| Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
 The manager does not collect prompts, responses, API keys,
@@ -236,9 +260,15 @@ can cause the retained previous state to be imported again.
 
 Missing pressure or price appears as `N/A`. Recent averages remain visible
 until they expire, but missing current pressure prevents a fresh score. A price
-refresh failure can use the last cache, labeled with its fetch time. Models
-without an explicit price use Darkbloom's public fallback price when available.
-Without any usable price, a model is excluded from selection.
+refresh failure can use the last cache containing both prices, labeled with
+its fetch time. Models absent from the pricing response use Darkbloom's public
+fallback input and output prices when available.
+
+A listed model missing either price shows `N/A` for that component, the blend,
+and the score. Its known price stays visible. The manager does not replace a
+missing component with zero or a fallback. A zero price is accepted only when
+explicitly supplied; the blended price must be positive to allow selection.
+If the current model's score is unavailable, switching waits for usable data.
 
 If the catalog request fails, the last catalog remains visible as `stale cache`.
 Without a cached catalog, the report says `Catalog: unavailable` and still shows
@@ -284,6 +314,12 @@ python3 warm_model_manager.py --version
 Then use your existing launch command. Replacing the script leaves saved state
 intact. [Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
 are available on GitHub. The commands and filenames stay the same across releases.
+
+When upgrading from output-only scoring, the manager fetches both prices before
+scoring. If that fetch fails, prices remain unavailable until it succeeds.
+The formula change resets live and dry-run passing-check counts once. Retained
+pressure samples, minimum warm time, and any already-issued pending launch stay
+in place; normal sample expiration and timing-setting resets still apply.
 
 Remove old pairing and exploration flags, including `--no-pair` and
 `--no-exploration`. Those features are gone. Pending selections that contain

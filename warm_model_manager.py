@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Portable revenue-aware Darkbloom single-model warm loader.
 
-The manager combines Darkbloom's public capacity pressure with the output-token
-price.  Under the assumption that every managed model generates at the same
-speed, pressure multiplied by output USD per million tokens is a projected
-revenue-rate proxy.  Small preference weights remain a deliberate operator
-bias, not a claimed component of revenue.
+The score combines average network pressure, a fixed mix of 85% input and
+15% output token prices, and a preference weight. It compares models at the
+same assumed token mix without measuring provider throughput or actual payouts.
 
 Every selection requests exactly one warm model. The catalog, network capacity,
 and local scan supply the model table. Models absent from the local scan are
@@ -38,10 +36,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.3"
+MANAGER_VERSION = "0.1.4"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
+INPUT_TOKEN_SHARE = 0.85
+OUTPUT_TOKEN_SHARE = 0.15
+PRICING_CACHE_SCHEMA = 2
 DEFAULT_WEIGHTS = {
     "qwen3.5-35b-a3b": 1.25,
     "qwen3.6-35b-a3b-vl-mtp-mxfp8": 1.20,
@@ -71,7 +72,7 @@ MANAGER_STATE_KEYS = {
     "last_decision_at", "last_decision_reason", "last_decision_target",
     "last_score_snapshot", "last_switch_at", "manager_version",
     "pending_switch", "preload_sync_schema", "pressure_cadence", "pressure_history",
-    "pricing_cache", "pricing_status", "selection_policy", "state_schema",
+    "pricing_cache", "pricing_status", "scoring_policy", "selection_policy", "state_schema",
     "live_challenger_model", "live_challenger_streak",
     "dry_challenger_model", "dry_challenger_streak",
 }
@@ -83,6 +84,22 @@ class CapacitySample:
     warm_providers: int
     active_requests: int
     pressure: float
+
+
+@dataclass(frozen=True)
+class ModelPrice:
+    input_usd: float | None
+    output_usd: float | None
+
+    @property
+    def blended_usd(self) -> float | None:
+        if self.input_usd is None or self.output_usd is None:
+            return None
+        blended = INPUT_TOKEN_SHARE * self.input_usd + OUTPUT_TOKEN_SHARE * self.output_usd
+        return blended if math.isfinite(blended) and blended > 0 else None
+
+    def to_dict(self) -> dict[str, float | None]:
+        return {"input_usd": self.input_usd, "output_usd": self.output_usd}
 
 
 @dataclass(frozen=True)
@@ -136,44 +153,68 @@ def fetch_capacity(base_url: str) -> dict[str, CapacitySample]:
     return pressure_samples(payload.get("models") or [])
 
 
-def fetch_output_prices(pricing_url: str) -> tuple[dict[str, float], float]:
-    """Return platform output USD per million tokens and the fallback price."""
+def price_value(value: Any, divisor: float = 1.0) -> float | None:
+    """Keep missing or invalid prices distinct from an explicit zero price."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = float(value) / divisor
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
+
+
+def fetch_model_prices(pricing_url: str) -> tuple[dict[str, ModelPrice], ModelPrice]:
+    """Return platform input/output USD per million tokens and the fallback."""
     payload = get_json(pricing_url)
-    fallback = max(0, int(payload.get("fallback_output_price") or 0)) / 1_000_000
-    prices: dict[str, float] = {}
+    fallback = ModelPrice(
+        price_value(payload.get("fallback_input_price"), 1_000_000),
+        price_value(payload.get("fallback_output_price"), 1_000_000),
+    )
+    prices: dict[str, ModelPrice] = {}
     for row in payload.get("prices") or []:
         if not isinstance(row, dict) or not row.get("model"):
             continue
-        prices[str(row["model"])] = (
-            max(0, int(row.get("output_price") or 0)) / 1_000_000
+        prices[str(row["model"])] = ModelPrice(
+            price_value(row.get("input_price"), 1_000_000),
+            price_value(row.get("output_price"), 1_000_000),
         )
-    if not prices and fallback <= 0:
-        raise RuntimeError("Darkbloom returned no usable output-token prices")
+    if not prices and fallback.blended_usd is None:
+        raise RuntimeError("Darkbloom returned no usable input/output prices")
     return prices, fallback
 
 
-def cached_output_prices(
+def cached_model_prices(
     manager_state: dict[str, Any],
     models: list[str],
     pricing_url: str,
     now: float,
     refresh_seconds: float,
-) -> dict[str, float]:
+) -> dict[str, ModelPrice]:
     cache = manager_state.get("pricing_cache")
     cache = cache if isinstance(cache, dict) else {}
-    cached_at = float(cache.get("fetched_at") or 0)
-    cached_prices = cache.get("prices")
-    cached_prices = cached_prices if isinstance(cached_prices, dict) else {}
-    fallback = max(0.0, float(cache.get("fallback_output_usd") or 0))
+    # Older caches contain only output prices. Never invent an input price
+    # from them; fetch both components before allowing a blended score.
+    if cache.get("source") != pricing_url or cache.get("schema") != PRICING_CACHE_SCHEMA:
+        cache = {}
+        manager_state.pop("pricing_cache", None)
+    cached_at = price_value(cache.get("fetched_at")) or 0.0
 
-    if cache.get("source") != pricing_url:
-        cached_prices, fallback, cached_at = {}, 0.0, 0.0
+    def decode(value: Any) -> ModelPrice:
+        row = value if isinstance(value, dict) else {}
+        return ModelPrice(price_value(row.get("input_usd")), price_value(row.get("output_usd")))
+
+    entries = cache.get("prices")
+    cached_prices = {
+        model: decode(value) for model, value in entries.items()
+    } if isinstance(entries, dict) else {}
+    fallback = decode(cache.get("fallback"))
     status = "cached"
-    if not cached_prices or now - cached_at >= refresh_seconds:
+    if not cached_at or now - cached_at >= refresh_seconds:
         try:
-            live_prices, live_fallback = fetch_output_prices(pricing_url)
+            live_prices, live_fallback = fetch_model_prices(pricing_url)
         except Exception as error:
-            status = "stale cache" if cached_prices else "unavailable"
+            status = "stale cache" if cached_at else "unavailable"
             log(f"pricing refresh failed ({error}); prices: {status}")
         else:
             status = "live"
@@ -181,9 +222,10 @@ def cached_output_prices(
             fallback = live_fallback
             cached_at = now
             manager_state["pricing_cache"] = {
+                "schema": PRICING_CACHE_SCHEMA,
                 "fetched_at": now,
-                "prices": live_prices,
-                "fallback_output_usd": live_fallback,
+                "prices": {model: price.to_dict() for model, price in live_prices.items()},
+                "fallback": live_fallback.to_dict(),
                 "source": pricing_url,
             }
 
@@ -193,12 +235,9 @@ def cached_output_prices(
         "source": pricing_url,
     }
 
-    resolved = {}
-    for model in models:
-        price = float(cached_prices.get(model, fallback) or 0)
-        if math.isfinite(price) and price > 0:
-            resolved[model] = price
-    return resolved
+    # A fallback is for an absent model, not a missing component of a listed
+    # model's price. Keep partial prices visible but exclude them from scoring.
+    return {model: cached_prices.get(model, fallback) for model in models}
 
 
 def pressure_samples(rows: Iterable[dict[str, Any]]) -> dict[str, CapacitySample]:
@@ -298,15 +337,29 @@ def ensure_preload_sync_policy(manager_state: dict[str, Any]) -> bool:
     return discarded_pending
 
 
+def ensure_scoring_policy(manager_state: dict[str, Any]) -> bool:
+    """Start new passing-check counts when the formula changes, keeping warmth."""
+    desired = {"input_token_share": INPUT_TOKEN_SHARE, "output_token_share": OUTPUT_TOKEN_SHARE}
+    if manager_state.get("scoring_policy") == desired:
+        return False
+    for key in (
+        "live_challenger_model", "live_challenger_streak",
+        "dry_challenger_model", "dry_challenger_streak",
+    ):
+        manager_state.pop(key, None)
+    manager_state["scoring_policy"] = desired
+    return True
+
+
 def revenue_scores(
     pressures: dict[str, float],
     weights: dict[str, float],
-    output_prices: dict[str, float],
+    prices: dict[str, ModelPrice],
 ) -> dict[str, float]:
     return {
-        model: pressure * output_prices[model] * weights.get(model, 1.0)
+        model: pressure * prices[model].blended_usd * weights.get(model, 1.0)
         for model, pressure in pressures.items()
-        if model in output_prices
+        if model in prices and prices[model].blended_usd is not None
     }
 
 
@@ -315,7 +368,7 @@ def build_score_snapshot(
     samples: dict[str, CapacitySample],
     averages: dict[str, float],
     history: dict[str, list[dict[str, float]]],
-    output_prices: dict[str, float],
+    prices: dict[str, ModelPrice],
     weights: dict[str, float],
     scores: dict[str, float],
     observed_at: float,
@@ -348,20 +401,21 @@ def build_score_snapshot(
             status.append("outside --model selection")
         if sample is None:
             status.append("capacity unavailable; AVG retained" if history.get(model) else "capacity unavailable")
-        if model not in output_prices:
-            status.append("price unavailable")
-        projected = (
-            averages[model] * output_prices[model]
-            if sample is not None and model in averages and model in output_prices
-            else None
-        )
+        price = prices.get(model, ModelPrice(None, None))
+        if price.input_usd is None:
+            status.append("input price unavailable")
+        if price.output_usd is None:
+            status.append("output price unavailable")
+        if price.input_usd is not None and price.output_usd is not None and price.blended_usd is None:
+            status.append("no positive blended price")
         model_values[model] = {
             "now_pressure": sample.pressure if sample is not None else None,
             "average_pressure": averages.get(model),
             "capacity_available": sample is not None,
             "retained_samples": len(history.get(model, [])),
-            "output_usd_per_million": output_prices.get(model),
-            "projected_usd_per_million": projected,
+            "input_usd_per_million": price.input_usd,
+            "output_usd_per_million": price.output_usd,
+            "blended_usd_per_million": price.blended_usd,
             "preference": weights.get(model, 1.0),
             "score": scores.get(model),
             "ignored": ignored,
@@ -374,6 +428,8 @@ def build_score_snapshot(
     return {
         "observed_at": observed_at,
         "window_seconds": window_seconds,
+        "input_token_share": INPUT_TOKEN_SHARE,
+        "output_token_share": OUTPUT_TOKEN_SHARE,
         "models": model_values,
     }
 
@@ -1085,7 +1141,7 @@ def print_report(
     samples: dict[str, CapacitySample],
     averages: dict[str, float],
     weights: dict[str, float],
-    output_prices: dict[str, float],
+    prices: dict[str, ModelPrice],
     scores: dict[str, float],
     pressure_history: dict[str, list[dict[str, float]]],
     manager_state: dict[str, Any],
@@ -1108,10 +1164,14 @@ def print_report(
     )
     mode = "LIVE — changes enabled" if apply else "DRY RUN — no changes enabled"
     model_width = max([25, *(len(display_name(model)) + 2 for model in models)])
+    average_label = f"AVG {format_duration(interval_seconds * history_size)}"
+    table_header = (
+        f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} "
+        f"{'IN$/M':>7} {'OUT$/M':>7} {'BLEND$/M':>8} {'PREF':>5} {'SCORE':>7} STATUS"
+    )
 
     print("", flush=True)
-    print("=" * (model_width + 63), flush=True)
-    average_label = f"AVG {format_duration(interval_seconds * history_size)}"
+    print("=" * len(table_header), flush=True)
     print(
         f"Darkbloom Warm Model Manager ({MANAGER_VERSION})  |  {timestamp}",
         flush=True,
@@ -1142,14 +1202,10 @@ def print_report(
             flush=True,
         )
     print("", flush=True)
-    print(
-        f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} {'OUT$/M':>7} "
-        f"{'PROJ$/M':>8} {'PREF':>5} {'SCORE':>7} STATUS",
-        flush=True,
-    )
-    print("-" * (model_width + 63), flush=True)
-    def number(value: float | None) -> str:
-        return f"{value:.3f}" if value is not None else "N/A"
+    print(table_header, flush=True)
+    print("-" * len(table_header), flush=True)
+    def number(value: float | None, decimals: int = 3) -> str:
+        return f"{value:.{decimals}f}" if value is not None else "N/A"
 
     snapshot_models = (manager_state.get("last_score_snapshot") or {}).get("models", {})
     for model in models:
@@ -1163,15 +1219,14 @@ def print_report(
             else " "
         )
         label = f"{marker} {display_name(model)}"
-        projected = (
-            averages[model] * output_prices[model] if model in scores else None
-        )
+        price = prices.get(model, ModelPrice(None, None))
         sample_count = len(pressure_history.get(model, []))
         status = snapshot_models.get(model, {}).get("status", [])
         print(
             f"{label:<{model_width}} {number(sample.pressure if sample else None):>6} "
             f"{number(averages.get(model)):>8} {sample_count:>3} "
-            f"{number(output_prices.get(model)):>7} {number(projected):>8} "
+            f"{number(price.input_usd, 4):>7} {number(price.output_usd, 4):>7} "
+            f"{number(price.blended_usd, 4):>8} "
             f"{weights.get(model, 1.0):>5.2f} {number(scores.get(model)):>7} "
             + "; ".join(status),
             flush=True,
@@ -1224,10 +1279,10 @@ def print_report(
     if blocked and decision.target is not None and not selection_ready and not decision.warming:
         print(f"Deferred:  {blocked}", flush=True)
     print(
-        "Score = average pressure × output $/M tokens × preference; "
-        "PROJ$/M excludes preference.",
+        f"BLEND$/M = {INPUT_TOKEN_SHARE:.0%} input price + {OUTPUT_TOKEN_SHARE:.0%} output price per million total tokens.",
         flush=True,
     )
+    print("Score = average pressure × BLEND$/M × preference (ranking estimate).", flush=True)
     print(
         f"N is the number of retained samples (max {history_size}, --average-samples); samples expire "
         f"after {format_duration(interval_seconds * history_size)}.",
@@ -1322,10 +1377,13 @@ class Manager:
             self.args.average_samples,
         )
         discarded_legacy_pending = ensure_preload_sync_policy(manager_state)
+        scoring_changed = ensure_scoring_policy(manager_state)
         if migrated_history:
             log("initialized timestamped pressure samples")
         elif cadence_changed:
             log("saved pressure samples and consecutive check counts reset because --check-every or --average-samples changed")
+        if scoring_changed and not migrated_history:
+            log("scoring formula changed; consecutive passing checks reset")
         if discarded_legacy_pending:
             log(
                 "discarded a legacy pending switch so startup preload can be "
@@ -1363,7 +1421,7 @@ class Manager:
             now,
             self.args.check_every * self.args.average_samples,
         )
-        output_prices = cached_output_prices(
+        prices = cached_model_prices(
             manager_state,
             self.models,
             self.args.pricing_url,
@@ -1377,7 +1435,7 @@ class Manager:
         # fresh score and must not drive selection.
         all_scores = revenue_scores(
             {model: average for model, average in averages.items() if model in samples},
-            self.weights, output_prices,
+            self.weights, prices,
         )
         eligible_models = [model for model in local_eligible if model in all_scores]
         scores = {
@@ -1391,7 +1449,7 @@ class Manager:
             samples,
             averages,
             history,
-            output_prices,
+            prices,
             self.weights,
             all_scores,
             now,
@@ -1466,7 +1524,7 @@ class Manager:
             samples,
             averages,
             self.weights,
-            output_prices,
+            prices,
             all_scores,
             history,
             manager_state,
@@ -1616,7 +1674,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decision-horizon", type=positive_float, default=3600, help="seconds over which a switch must repay its cost (default 3600)")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Darkbloom public console base URL")
     parser.add_argument("--pricing-url", default=DEFAULT_PRICING_URL, help="Darkbloom public pricing endpoint")
-    parser.add_argument("--pricing-refresh", type=positive_float, default=900, help="seconds to cache output-token prices (default 900)")
+    parser.add_argument("--pricing-refresh", type=positive_float, default=900, help="seconds to cache input/output token prices (default 900)")
     parser.add_argument("--darkbloom", default="darkbloom", help="path to the darkbloom executable")
     parser.add_argument(
         "--config",

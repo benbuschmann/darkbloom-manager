@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4 — 2026-09-09
+
+- Score every model using average pressure × (85% input price + 15% output
+  price) × preference. Keep existing weights, timing defaults, switch costs,
+  and relative/absolute score requirements.
+- Show `IN$/M`, `OUT$/M`, and `BLEND$/M` with four decimal places. Replace
+  `PROJ$/M` and save both prices, the blend, and the fixed token mix with each
+  score snapshot, including ignored and auto-ignored models.
+- Cache both prices and their public fallbacks. Missing or invalid components
+  stay unavailable and cannot produce a score; an explicit zero component is
+  allowed when the blend remains positive.
+- Refresh output-only caches and reset passing-check counts once when adopting
+  the new formula. Preserve timestamped pressure history, minimum warm time,
+  and already-issued pending launches.
+- Update README formulas, table explanations, examples, and upgrade notes.
+
 ## 0.1.3 — 2026-09-08
 
 - Check every 60 seconds, average up to 15 recent samples, and require three
