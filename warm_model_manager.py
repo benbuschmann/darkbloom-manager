@@ -6,8 +6,9 @@ The score combines average network pressure, a fixed mix of 85% input and
 same assumed token mix without measuring provider throughput or actual payouts.
 
 Every selection requests exactly one warm model. The catalog, network capacity,
-and local scan supply the model table. Models absent from the local scan are
-automatically ignored; explicit ignores also remain visible for comparison.
+and local scan supply the model inventory. Ignored and auto-ignored models stay
+visible by default. Use --hide-ignored to hide them from the table and its ranking;
+their calculations remain in saved state.
 
 The file is intentionally standalone: copy only this script to a Mac running
 Darkbloom.  It uses Python's standard library, the installed ``darkbloom``
@@ -36,7 +37,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MANAGER_VERSION = "0.1.6"
+MANAGER_VERSION = "0.1.7"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -1185,12 +1186,26 @@ def print_report(
     eligible_models: list[str],
     blocked: str | None,
     improvement_percent: float,
+    hide_ignored: bool,
 ) -> None:
     timestamp = datetime.fromtimestamp(now).astimezone().strftime(
         "%Y-%m-%d %H:%M:%S %Z"
     )
     mode = "LIVE — changes enabled" if apply else "DRY RUN — no changes enabled"
-    model_width = max([25, *(len(display_name(model)) + 2 for model in models)])
+    snapshot_models = (manager_state.get("last_score_snapshot") or {}).get("models", {})
+    hidden_ignored = {
+        model for model in models
+        if model in ignored_models or snapshot_models.get(model, {}).get("ignored")
+    }
+    hidden_auto = {
+        model for model in models
+        if model not in hidden_ignored and snapshot_models.get(model, {}).get("auto_ignored")
+    }
+    shown_models = (
+        [model for model in models if model not in hidden_ignored | hidden_auto]
+        if hide_ignored else models
+    )
+    model_width = max([25, *(len(display_name(model)) + 2 for model in shown_models)])
     average_label = f"AVG {format_duration(interval_seconds * history_size)}"
     table_header = (
         f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} "
@@ -1220,6 +1235,12 @@ def print_report(
     fetched_at = pricing.get("fetched_at")
     price_age = f"; fetched {format_local_time(fetched_at, now)}" if fetched_at else ""
     print(f"Prices:    {pricing.get('status', 'unknown')}{price_age}", flush=True)
+    if hide_ignored:
+        print(
+            f"Models:    {len(shown_models)} shown; {len(hidden_ignored)} ignored hidden; "
+            f"{len(hidden_auto)} auto-ignored hidden",
+            flush=True,
+        )
     if current and residency:
         elapsed, warm_since = residency
         print(
@@ -1234,8 +1255,9 @@ def print_report(
     def number(value: float | None, decimals: int = 3) -> str:
         return f"{value:.{decimals}f}" if value is not None else "N/A"
 
-    snapshot_models = (manager_state.get("last_score_snapshot") or {}).get("models", {})
-    for model in models:
+    if not shown_models:
+        print("No models to show.", flush=True)
+    for model in shown_models:
         sample = samples.get(model)
         marker = (
             "*"
@@ -1258,15 +1280,17 @@ def print_report(
             + "; ".join(status),
             flush=True,
         )
-    if scores:
+    shown_scores = {model: scores[model] for model in shown_models if model in scores}
+    if shown_scores:
         print("", flush=True)
-        highest = max(scores.values())
-        leaders = [model for model in models if scores.get(model) == highest]
+        highest = max(shown_scores.values())
+        leaders = [model for model in shown_models if shown_scores.get(model) == highest]
         names = [display_name(model) + (
-            " [IGNORED]" if model in ignored_models else
-            " [AUTO-IGNORED]" if snapshot_models.get(model, {}).get("auto_ignored") else ""
+            " [IGNORED]" if model in hidden_ignored else
+            " [AUTO-IGNORED]" if model in hidden_auto else ""
         ) for model in leaders]
-        print("Highest raw score: " + " = ".join(names) + f" ({highest:.3f}).", flush=True)
+        ranking_label = "Highest raw score (shown models)" if hide_ignored else "Highest raw score"
+        print(ranking_label + ": " + " = ".join(names) + f" ({highest:.3f}).", flush=True)
         print("Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.", flush=True)
         print("Ignored and auto-ignored models cannot be loaded.", flush=True)
     print("", flush=True)
@@ -1337,7 +1361,7 @@ class Manager:
         try:
             local = local_model_ids(self.args.darkbloom, self.args.config)
         except Exception as error:
-            # Retain the last inventory for display only. An unsuccessful scan
+            # Retain the last inventory in state. An unsuccessful scan
             # cannot authorize a launch, even when yesterday's inventory could.
             local = set()
             visible = previous.get("models", [])
@@ -1432,7 +1456,7 @@ class Manager:
             samples = {}
             log(f"network capacity unavailable: {error}")
 
-        # The catalog and capacity feed expand visibility only. They cannot
+        # The catalog and capacity feed expand the saved inventory only. They cannot
         # authorize loading a model absent from a successful local scan.
         visible = catalog | set(samples) | set(manager_state["discovery"].get("models") or []) | self.ignored
         self.models = list(dict.fromkeys([
@@ -1575,6 +1599,7 @@ class Manager:
             eligible_models,
             blocked,
             self.args.switch_improvement_percent,
+            self.args.hide_ignored,
         )
         selection_matches = warm_selection_matches(
             daemon,
@@ -1697,10 +1722,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("mode", choices=("once", "run"), nargs="?", default="once")
     parser.add_argument("--apply", action="store_true", help="actually switch models; default is dry-run")
-    parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible (default: all locally discovered models)")
+    parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible unless --hide-ignored is set (default: all locally discovered models)")
     parser.add_argument(
-        "--ignore-model", "--ignore", action="append", default=[], metavar="MODEL_ID",
-        help="score and display this model but never select or load it; repeat as needed",
+        "--ignore-model", "--ignore", action="extend", nargs="+", default=[], metavar="MODEL_ID",
+        help="never select or load these models; accepts one or more space-separated IDs; repeat as needed; visible unless --hide-ignored is set",
+    )
+    parser.add_argument(
+        "--hide-ignored", action="store_true",
+        help="hide ignored and auto-ignored models from the table and its ranking; keep their calculations in saved state",
     )
     parser.add_argument(
         "--weight",

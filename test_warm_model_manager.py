@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from warm_model_manager import (
     CapacitySample,
@@ -69,7 +69,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.6")
+        self.assertEqual(MANAGER_VERSION, "0.1.7")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -905,6 +905,27 @@ class DiscoveryTests(unittest.TestCase):
         args = build_parser().parse_args(["--ignore-model", IGNORED, "--ignore", "other"])
         self.assertEqual(args.ignore_model, [IGNORED, "other"])
         self.assertIsNone(args.model)
+        self.assertFalse(args.hide_ignored)
+
+    def test_ignore_accepts_multiple_ids_per_flag_and_keeps_following_options(self) -> None:
+        args = build_parser().parse_args([
+            "run", "--ignore-model", IGNORED, "Qwen3.5-9B",
+            "--ignore", "gpt-oss-20b", "gemma-4-26b-8bit",
+            "--ignore-model", IGNORED, "--hide-ignored", "--check-every", "120", "--apply",
+        ])
+        self.assertEqual(args.ignore_model, [IGNORED, "Qwen3.5-9B", "gpt-oss-20b", "gemma-4-26b-8bit", IGNORED])
+        self.assertEqual(args.mode, "run")
+        self.assertEqual(args.check_every, 120)
+        self.assertTrue(args.apply)
+        self.assertTrue(args.hide_ignored)
+
+    def test_ignore_requires_at_least_one_id_per_occurrence(self) -> None:
+        for flag in ("--ignore-model", "--ignore"):
+            for following in ([], ["--apply"]):
+                with self.subTest(flag=flag, following=following), redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as error:
+                    build_parser().parse_args(["once", flag, *following])
+                self.assertEqual(error.exception.code, 2)
 
     def test_each_model_is_eligible_independently(self) -> None:
         gemma, gpt = "gemma-4-26b-qat-4bit", "gpt-oss-20b"
@@ -1096,6 +1117,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.path.write_text(json.dumps(state))
 
     def test_ignored_leader_has_all_math_persisted_but_is_never_selected(self) -> None:
+        self.args.hide_ignored = True
         self.prices.return_value[0][IGNORED] = ModelPrice(0.15, 2.0)
         state, report = self.tick()
         row = state["last_score_snapshot"]["models"][IGNORED]
@@ -1110,9 +1132,107 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(row["score"], 42.75)
         self.assertEqual(state["pressure_history"][IGNORED], [{"at": 10000, "pressure": 100}])
         self.assertEqual(state["last_decision_target"], "good")
-        self.assertIn(f"Highest raw score: {IGNORED} [IGNORED]", report)
+        self.assertNotIn(IGNORED, report)
+        self.assertIn("Highest raw score (shown models): good (0.500).", report)
+        self.assertIn("Models:    1 shown; 1 ignored hidden; 0 auto-ignored hidden", report)
         self.assertNotIn("WOULD SWITCH", report)
         self.launch.assert_not_called()
+
+    def test_hidden_models_do_not_widen_table_and_missing_data_stays_visible(self) -> None:
+        self.args.hide_ignored = True
+        hidden = "not-downloaded-" + "x" * 150
+        self.catalog.return_value = {"good", "missing-data", hidden}
+        self.local.return_value = {"good", "missing-data"}
+        state, report = self.tick()
+        self.assertNotIn(hidden, report)
+        self.assertNotIn(IGNORED, report)
+        self.assertTrue(state["last_score_snapshot"]["models"][hidden]["auto_ignored"])
+        self.assertFalse(state["last_score_snapshot"]["models"]["missing-data"]["auto_ignored"])
+        row = next(line for line in report.splitlines() if line.startswith("  missing-data"))
+        self.assertIn("N/A", row)
+        self.assertIn("capacity unavailable", row)
+        header = next(line for line in report.splitlines() if line.startswith("MODEL ID"))
+        self.assertEqual(header.index("NOW"), 29)
+        self.assertIn("Models:    2 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
+        self.assertIn("\n\nHighest raw score (shown models): good (0.500).", report)
+        self.launch.assert_not_called()
+
+    def test_multiple_ignored_ids_are_hidden_and_block_saved_launches_through_cli(self) -> None:
+        ignored = {IGNORED, "second-hidden", "third-hidden"}
+        self.local.return_value = {"good", *ignored}
+        self.capacity.return_value = self.samples(good=1, **{model: 100 for model in ignored})
+        original, _ = self.tick()
+        self.daemon.return_value = LocalDaemonState(None, (), False, 123, 100, True)
+        for apply, hide in ((False, False), (False, True), (True, False), (True, True)):
+            for pending_target in ignored:
+                with self.subTest(apply=apply, hide=hide, pending_target=pending_target):
+                    self.launch.reset_mock()
+                    state = dict(original)
+                    state["pending_switch"] = {
+                        "target": pending_target, "warm_models": [pending_target], "command_at": 10000,
+                    }
+                    state.update(live_challenger_model=pending_target, live_challenger_streak=100)
+                    self.save(state)
+                    command = [
+                        "warm_model_manager.py", "once", "--state", str(self.path),
+                        "--ignore-model", IGNORED, "second-hidden",
+                        "--ignore", "third-hidden", IGNORED,
+                        *(["--hide-ignored"] if hide else []),
+                        *(["--apply"] if apply else []),
+                    ]
+                    output = io.StringIO()
+                    with patch.object(sys, "argv", command), \
+                            patch("warm_model_manager.DEFAULT_STATE_PATH", self.path), \
+                            patch("warm_model_manager.signal.signal"), redirect_stdout(output):
+                        self.assertEqual(main(), 0)
+                    state = json.loads(self.path.read_text())
+                    report = output.getvalue()
+                    self.assertEqual(state["last_decision_target"], "good")
+                    if hide:
+                        self.assertIn("Models:    1 shown; 3 ignored hidden; 0 auto-ignored hidden", report)
+                    else:
+                        self.assertNotIn("ignored hidden", report)
+                    for model in ignored:
+                        if hide:
+                            self.assertNotIn(model, report)
+                        else:
+                            self.assertIn("  " + model, report)
+                        self.assertTrue(state["last_score_snapshot"]["models"][model]["ignored"])
+                        self.assertFalse(state["last_score_snapshot"]["models"][model]["eligible"])
+                        self.assertIsNotNone(state["last_score_snapshot"]["models"][model]["score"])
+                    if apply:
+                        self.launch.assert_called_once_with("darkbloom", "good", None, ignored)
+                        self.assertEqual(state["pending_switch"]["warm_models"], ["good"])
+                    else:
+                        self.launch.assert_not_called()
+                        self.assertNotIn("pending_switch", state)
+                        self.assertIn("WOULD SWITCH", report)
+
+    def test_default_shows_ignored_models_and_display_toggle_keeps_passing_checks(self) -> None:
+        self.catalog.return_value = {"good", "candidate", "remote"}
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=10, remote=1000, **{IGNORED: 100})
+        self.assertFalse(self.args.hide_ignored)
+        for check, hide in enumerate((False, True, False), start=1):
+            self.args.hide_ignored = hide
+            state, report = self.tick(10000 + (check - 1) * 60)
+            if hide:
+                self.assertNotIn(IGNORED, report)
+                self.assertNotIn("remote", report)
+                self.assertIn("Highest raw score (shown models): candidate (2.000).", report)
+            else:
+                self.assertIn("  " + IGNORED, report)
+                self.assertIn("  remote", report)
+                self.assertIn("Highest raw score: remote [AUTO-IGNORED] (200.000).", report)
+                self.assertIn("IGNORED; not downloaded or filtered out", report)
+                self.assertNotIn("ignored hidden", report)
+            for model in ("good", "candidate", "remote", IGNORED):
+                self.assertEqual(len(state["pressure_history"][model]), check)
+            if check < 3:
+                self.assertEqual(state["live_challenger_streak"], check)
+                self.launch.assert_not_called()
+        self.assertEqual(state["last_decision_target"], "candidate")
+        self.launch.assert_called_once_with("darkbloom", "candidate", None, {IGNORED})
 
     def test_blended_winner_obeys_cost_margins_and_three_checks_in_live_and_dry_run(self) -> None:
         q35, q9 = "qwen3.5-35b-a3b", "Qwen3.5-9B"
@@ -1263,6 +1383,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.launch.assert_not_called()
 
     def test_catalog_models_without_downloads_are_scored_but_never_selected(self) -> None:
+        self.args.hide_ignored = True
         remote = "Qwen3.5-9B"
         self.catalog.return_value = {"good", remote, "catalog-only"}
         self.local.return_value = {"good"}
@@ -1282,8 +1403,10 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.assertTrue(row["auto_ignored"])
                 self.assertFalse(row["local_available"])
                 self.assertFalse(row["eligible"])
-                self.assertIn("AUTO-IGNORED; not downloaded or filtered out", report)
-                self.assertIn(f"Highest raw score: {remote} [AUTO-IGNORED]", report)
+                self.assertNotIn(remote, report)
+                self.assertNotIn("catalog-only", report)
+                self.assertIn("Models:    1 shown; 1 ignored hidden; 2 auto-ignored hidden", report)
+                self.assertIn("Highest raw score (shown models): good (0.500).", report)
                 missing = state["last_score_snapshot"]["models"]["catalog-only"]
                 self.assertIsNone(missing["score"])
                 self.assertIsNone(missing["now_pressure"])
@@ -1294,18 +1417,22 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.launch.assert_not_called()
 
     def test_download_becomes_eligible_then_removal_revokes_pending_selection(self) -> None:
+        self.args.hide_ignored = True
         remote = "Qwen3.5-9B"
         self.local.return_value = {"good"}
         self.catalog.return_value = {"good", remote, IGNORED}
         self.capacity.return_value = self.samples(good=1, **{remote: 100, IGNORED: 1000})
-        state, _ = self.tick()
+        state, report = self.tick()
         self.assertTrue(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
+        self.assertNotIn(remote, report)
         self.local.return_value = {"good", remote, IGNORED}
         for index in range(1, 4):
-            state, _ = self.tick(10000 + index * 60)
+            state, report = self.tick(10000 + index * 60)
             self.assertFalse(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
             self.assertTrue(state["last_score_snapshot"]["models"][remote]["eligible"])
             self.assertTrue(state["last_score_snapshot"]["models"][IGNORED]["ignored"])
+            self.assertIn("  " + remote, report)
+            self.assertNotIn(IGNORED, report)
             if index < 3:
                 self.assertEqual(state["live_challenger_streak"], index)
                 self.launch.assert_not_called()
@@ -1318,9 +1445,11 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertTrue(state["last_score_snapshot"]["models"][remote]["auto_ignored"])
         self.assertEqual(len(state["pressure_history"][remote]), 5)
         self.assertIn("discarded pending switch", report)
+        self.assertNotIn("  " + remote, report)
         self.launch.assert_called_once()
 
-    def test_model_flag_restricts_loading_without_hiding_catalog_rows(self) -> None:
+    def test_model_flag_restricts_loading_and_hides_excluded_catalog_rows(self) -> None:
+        self.args.hide_ignored = True
         self.catalog.return_value = {"first", "second", "excluded"}
         self.local.return_value = set(self.catalog.return_value)
         self.capacity.return_value = self.samples(first=1, second=1, excluded=1000)
@@ -1337,7 +1466,8 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.assertTrue(row["local_available"])
                 self.assertTrue(row["excluded_by_model_flag"])
                 self.assertTrue(row["auto_ignored"])
-                self.assertIn("AUTO-IGNORED; outside --model selection", report)
+                self.assertNotIn("excluded", report)
+                self.assertIn("Highest raw score (shown models): second = first (0.200).", report)
                 if not apply:
                     self.launch.assert_not_called()
         self.launch.assert_called_once_with("darkbloom", "second", None, {IGNORED})
@@ -1443,14 +1573,17 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 
-    def test_filtered_ignored_id_is_still_scored_and_shown(self) -> None:
+    def test_filtered_ignored_id_is_still_scored_but_hidden(self) -> None:
+        self.args.hide_ignored = True
         self.local.return_value = {"good"}
         state, report = self.tick()
         self.assertIn(IGNORED, self.manager.models)
         self.assertEqual(state["last_score_snapshot"]["models"][IGNORED]["score"], 75)
-        self.assertIn("IGNORED", report)
+        self.assertNotIn(IGNORED, report)
+        self.assertIn("1 ignored hidden", report)
 
     def test_missing_capacity_preserves_aging_history_without_inventing_score(self) -> None:
+        self.args.hide_ignored = True
         self.tick()
         self.capacity.return_value = self.samples(good=1)
         state, report = self.tick(10060)
@@ -1458,12 +1591,14 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertIsNone(row["now_pressure"])
         self.assertEqual(row["average_pressure"], 100)
         self.assertIsNone(row["score"])
-        self.assertIn("capacity unavailable; AVG retained", report)
+        self.assertIn("capacity unavailable; AVG retained", row["status"])
+        self.assertNotIn(IGNORED, report)
         state, _ = self.tick(10300)
         self.assertEqual(state["pressure_history"][IGNORED], [])
         self.assertIsNone(state["last_score_snapshot"]["models"][IGNORED]["average_pressure"])
 
-    def test_network_outage_still_prints_and_persists_ignored_row(self) -> None:
+    def test_network_outage_still_persists_ignored_row_without_showing_it(self) -> None:
+        self.args.hide_ignored = True
         self.capacity.side_effect = RuntimeError("offline")
         self.prices.side_effect = RuntimeError("offline")
         state, report = self.tick()
@@ -1471,16 +1606,20 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertIsNone(row["score"])
         self.assertIsNone(row["output_usd_per_million"])
         self.assertIn("N/A", report)
-        self.assertIn("IGNORED; capacity unavailable; input price unavailable; output price unavailable", report)
+        self.assertEqual(row["status"], ["IGNORED", "capacity unavailable", "input price unavailable", "output price unavailable"])
+        self.assertNotIn(IGNORED, report)
         self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 
     def test_missing_price_for_ignored_model_does_not_block_eligible_model(self) -> None:
+        self.args.hide_ignored = True
         self.prices.return_value = ({"good": ModelPrice(0.5, 0.5)}, ModelPrice(None, None))
         state, report = self.tick()
         self.assertEqual(state["last_decision_target"], "good")
         self.assertIsNone(state["last_score_snapshot"]["models"][IGNORED]["score"])
-        self.assertIn("IGNORED; input price unavailable; output price unavailable", report)
+        self.assertEqual(state["last_score_snapshot"]["models"][IGNORED]["status"],
+                         ["IGNORED", "input price unavailable", "output price unavailable"])
+        self.assertNotIn(IGNORED, report)
 
     def test_stale_pricing_cache_is_identified(self) -> None:
         self.tick()
@@ -1516,7 +1655,8 @@ class ManagerIntegrationTests(unittest.TestCase):
             self.assertEqual(state["last_decision_target"], "good")
         self.launch.assert_not_called()
 
-    def test_discovery_failure_disables_selection_but_retains_display(self) -> None:
+    def test_discovery_failure_disables_selection_and_hides_inventory(self) -> None:
+        self.args.hide_ignored = True
         self.tick()
         before = list(self.manager.models)
         self.local.side_effect = RuntimeError("scan failed")
@@ -1524,15 +1664,21 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.manager.models, before)
         self.assertIsNone(state["last_decision_target"])
         self.assertIn("Discovery: unavailable", report)
+        self.assertIn("Models:    0 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
+        self.assertIn("No models to show.", report)
+        self.assertNotIn("Highest raw score", report)
         self.launch.assert_not_called()
 
     def test_all_ignored_or_empty_local_inventory_reports_without_launching(self) -> None:
+        self.args.hide_ignored = True
         for local in ({IGNORED}, set()):
             with self.subTest(local=local):
                 self.local.return_value = local
                 state, report = self.tick()
                 self.assertIsNone(state["last_decision_target"])
-                self.assertIn(IGNORED, report)
+                self.assertNotIn(IGNORED, report)
+                self.assertIn("No models to show.", report)
+                self.assertNotIn("Highest raw score", report)
                 self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 
@@ -1692,13 +1838,17 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.tick()
         self.launch.assert_not_called()
 
-    def test_empty_local_inventory_keeps_network_models_visible_without_ignore_flags(self) -> None:
+    def test_empty_local_inventory_saves_network_models_but_hides_them_without_ignore_flags(self) -> None:
+        self.args.hide_ignored = True
         self.local.return_value = set()
         self.args.ignore_model = []
         self.manager = Manager(self.args)
         state, report = self.tick()
         self.assertEqual(set(state["last_score_snapshot"]["models"]), {"good", IGNORED})
         self.assertTrue(all(row["auto_ignored"] for row in state["last_score_snapshot"]["models"].values()))
+        self.assertIn("Models:    0 shown; 0 ignored hidden; 2 auto-ignored hidden", report)
+        self.assertIn("No models to show.", report)
+        self.assertNotIn("Highest raw score", report)
         self.assertIn("WAIT", report)
         self.launch.assert_not_called()
 

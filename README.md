@@ -49,6 +49,9 @@ to override them.
 Each report starts with a separator. A blank line separates the model table
 from the highest-score line.
 
+Add `--hide-ignored` to hide ignored and auto-ignored models from the table
+and its ranking. Without it, all models remain visible as before.
+
 Without `--apply`, the manager prints decisions and saves its own state. It
 does not launch a model or edit startup preloads. It still reads the catalog
 and local model list through Darkbloom, which may migrate an older provider config.
@@ -193,17 +196,39 @@ Without that restriction, the four weighted models above retain their tie
 order, followed by other IDs alphabetically. Explicit ignore IDs appear last
 unless placed earlier by `--model`. Each launch still requests one model.
 
-Use `--ignore-model MODEL_ID`, or `--ignore MODEL_ID`, to exclude a model from
-loading. The flag is repeatable and matches exact, case-sensitive IDs. Ignored
-models stay in the table, even when they are absent from the local list. Their
+Use `--ignore-model MODEL_ID [MODEL_ID ...]`, or its `--ignore` alias, to exclude
+models from loading. Give it space-separated IDs, repeat the flag, or combine
+both forms. IDs are exact and case-sensitive. For example:
+
+```sh
+python3 warm_model_manager.py run --apply \
+  --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp' 'Qwen3.5-9B' \
+  --hide-ignored
+```
+
+Put `run` or `once` before the flags. Each ignore flag takes one or more IDs;
+the next flag ends that list. Repeated single-model flags still work.
+
+Ignored models stay in the table by default, even when absent from the local list. Their
 rows show `IGNORED` alongside pressure, average, both prices, blend, weight, and score.
 Their calculations are saved too. An explicit ignore stays in effect even if
 you download the model later.
 
+With `--hide-ignored`, both `IGNORED` and `AUTO-IGNORED` rows are hidden.
+The report shows how many models are displayed and how many are hidden in each
+group. This also hides models excluded by `--model`. The highest-score line
+is labeled `Highest raw score (shown models)` and ranks only the displayed rows.
+If all rows are hidden, the table says `No models to show.`
+
+Hiding rows changes only the display. Their timestamped samples, prices, scores,
+and exclusion reasons remain in the state file. Toggling the flag preserves
+passing-check counts and warm-up tracking. The provider-status line still
+reports what is actually warm, even if that model's table row is hidden.
+
 The `MODEL ID` column and decision lines use the exact IDs accepted by
 `--ignore-model`, including capitalization and any namespace prefix.
 
-`Highest raw score` includes ignored and auto-ignored models, with their labels,
+By default, `Highest raw score` includes ignored and auto-ignored models, with their labels,
 and includes ties. It is measured before
 switch costs and thresholds. The `Decision`, `Candidate`, `Earliest switch`, and
 `Deferred` lines show what the manager can actually do. A saved pending switch
@@ -297,6 +322,8 @@ never permits a launch.
 
 If local discovery fails, the last inventory remains visible and new launches
 are blocked. Local availability is unknown, and the rows say `local scan unavailable`.
+With `--hide-ignored`, those rows are hidden until a successful scan confirms
+local availability. The `Discovery: unavailable` message remains visible.
 
 ### Why hasn't it switched?
 
@@ -336,6 +363,9 @@ Remove obsolete flags as described below, then run your launch command.
 Replacing the script leaves saved state intact.
 [Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
 are available on GitHub. Script and state filenames stay the same across releases.
+
+`--hide-ignored` is optional. Existing commands keep the full table. To hide
+excluded models, add the flag; your saved state and switching rules stay intact.
 
 The percentage-based switch rule replaces the old fixed `0.01` score requirement.
 Remove `--absolute-margin` if you used it. The default remains 25% improvement;

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7 — 2026-09-11
+
+- Add `--hide-ignored` to hide ignored and auto-ignored models from the table
+  and its ranking. Keep the full table by default. Show displayed and hidden
+  counts when the flag is used, and handle an empty table without a false leader.
+- Accept multiple space-separated model IDs after each `--ignore-model` or
+  `--ignore` flag. Repeated flags still work in either display mode.
+- Keep hidden models' calculations and timestamped samples in saved state.
+  Changing display mode does not reset passing checks or warm-up tracking.
+  Ignored models remain blocked from selection and saved pending launches.
+- Update help, README examples, and tests for both display modes, grouped
+  ignores, discovery changes, and missing data.
+
 ## 0.1.6 — 2026-09-09
 
 - Replace the fixed `0.01` score requirement with one percentage-based switch
