@@ -4,6 +4,37 @@ Keeps one downloaded model warm on a running Darkbloom provider. The manager
 compares public network pressure and input/output prices, waits for a sustained score
 advantage, then switches when the provider is idle.
 
+Shortened example with illustrative values:
+
+```text
+Mode:      DRY RUN — no changes enabled
+Darkbloom: RUNNING (pid 4242) | warm: qwen3.5-35b-a3b | idle
+Discovery: live (local scan; refreshed every check)
+Catalog:   live; 7 models; fetched 10:00 AM PDT
+Prices:    cached; fetched 9:55 AM PDT
+Current:   qwen3.5-35b-a3b warm for 1 hour (since 9:00 AM PDT)
+
+MODEL ID                            NOW  AVG 15m   N   IN$/M  OUT$/M BLEND$/M WEIGHT   SCORE STATUS
+---------------------------------------------------------------------------------------------------
+* qwen3.5-35b-a3b                 0.683    0.356  15  0.0800  0.7500   0.1805   1.25   0.080
+  qwen3.6-35b-a3b-vl-mtp-mxfp8    0.121    0.099  15  0.0500  0.7000   0.1475   1.20   0.018
+  gemma-4-26b-qat-4bit            0.843    0.591  15  0.0420  0.2200   0.0687   1.05   0.043
+  gpt-oss-20b                     1.004    1.241  15  0.0200  0.1000   0.0320   1.00   0.040
+  Qwen3.5-9B                      0.258    0.359  15  0.0800  0.1300   0.0875   1.00   0.031
+  gemma-4-26b-8bit                0.000    0.000  15  0.0420  0.2200   0.0687   1.00   0.000 AUTO-IGNORED; not downloaded or filtered out
+  EigenLabs/Qwen3.8-27B-4bit-mtp  2.049    2.080  15  0.1500  2.0000   0.4275   1.00   0.889 IGNORED; not downloaded or filtered out
+
+Highest raw score: EigenLabs/Qwen3.8-27B-4bit-mtp [IGNORED] (0.889).
+Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.
+Ignored and auto-ignored models cannot be loaded.
+
+Decision:  KEEP → qwen3.5-35b-a3b
+Switch rule: at least 25% score improvement after switch cost (--switch-improvement-percent).
+Reason:    no allowed model scores higher after switch cost (current 0.0803225)
+```
+
+[Install](#install) · [Run](#run) · [Read the report](#read-the-report) · [FAQ](#faq)
+
 ## Install
 
 You need an Apple Silicon Mac with a configured Darkbloom provider, downloaded
@@ -43,11 +74,7 @@ python3 warm_model_manager.py run --apply \
 
 The defaults check every minute, average up to 15 recent samples, require
 three consecutive checks that meet the 25% improvement requirement, and keep a model
-warm for at least 45 minutes before replacing it. Use the timing flags below
-to override them.
-
-Each report starts with a separator. A blank line separates the model table
-from the highest-score line.
+warm for at least 45 minutes before replacing it. Use the [switching flags](#switching-rules) to override them.
 
 Add `--hide-ignored` to hide ignored and auto-ignored models from the table
 and its ranking. Without it, all models remain visible as before.
@@ -60,31 +87,58 @@ Add `--config /path/to/provider.toml` if your provider uses a custom config.
 The catalog, local scan, and live launches all use that path. Use
 `--darkbloom /path/to/darkbloom` if the CLI is not on your `PATH`.
 
-A live switch runs `darkbloom start` with one `--model` and
-`--idle-timeout 0`. That restarts the provider. Before launching, the manager
-sets `backend.preload_models` to a one-element list containing the selected
-model, preserving the rest of the config text. It waits until fresh daemon
-state confirms exactly that model is warm before starting the minimum warm
-time. A provider restart also starts a new minimum warm period, even if the
-manager's saved switch time is older.
+## Read the report
 
-## Timing and scores
+In the example, Qwen 3.8 has the highest raw score at `0.889`, but it is ignored.
+The manager keeps `qwen3.5-35b-a3b`: its `0.080` score leads the models allowed
+to load. A high score alone does not approve a switch.
 
-| Flag | Default | What it controls |
-| --- | --- | --- |
-| `--check-every SECONDS` | 60 | Seconds between checks. Minimum: 60. |
-| `--average-samples COUNT` | 15 | Maximum number of recent pressure samples to average. |
-| `--switch-after-checks COUNT` | 3 | Consecutive checks the same candidate must pass before switching. |
-| `--min-warm-time SECONDS` | 2700 | Minimum time to keep a warm model before replacing it. |
+The `*` marks a currently warm model. Warm means the model is loaded in memory;
+`idle` means the provider is not currently serving a request. `Current` shows
+how long that model has been warm.
 
-The old names still work as aliases: `--interval`, `--history`,
-`--confirmations`, and `--min-dwell`, respectively.
+| Table column | Meaning |
+| --- | --- |
+| `MODEL ID` | Exact ID accepted by `--ignore-model`, including capitalization and namespace. |
+| `NOW` | Current public network pressure: active requests divided by warm providers, with a minimum denominator of 1. |
+| `AVG 15m` | Average of retained pressure samples. The time label follows your check interval and sample limit. |
+| `N` | Number of samples in that average. It can be below the limit after startup or during a data gap. |
+| `IN$/M` | Input price per million input tokens. |
+| `OUT$/M` | Output price per million output tokens. |
+| `BLEND$/M` | Price per million total tokens at the fixed 85% input / 15% output mix, before pressure and weight. |
+| `WEIGHT` | Model score multiplier, set with `--weight`. |
+| `SCORE` | Average pressure × blended price × weight. |
+| `STATUS` | Exclusion or missing-data reason. `IGNORED` is an explicit exclusion; `AUTO-IGNORED` follows local availability or `--model`. |
 
-Samples expire after `check-every × average-samples` seconds, including while
-the manager is stopped. With the defaults of `60` and `15`, the average contains
-at most 15 samples from the past 15 minutes. The table's `N` column shows how many are
-available. Changing either setting clears the old samples and resets the
-number of consecutive passing checks.
+Pressure describes the network, not the number of requests arriving at your
+Mac. Price columns show four decimal places; calculations use the full values.
+`N/A` means a value is unavailable, not zero.
+
+By default, `Highest raw score` includes ignored and auto-ignored models and
+shows ties. With `--hide-ignored`, it ranks only shown rows. In either view,
+the ranking comes before switch cost, required improvement, consecutive passing
+checks, and minimum warm time.
+
+| Decision | Meaning |
+| --- | --- |
+| `KEEP` | Keep the current model. |
+| `WOULD SWITCH` | A dry run selected a different model; no launch occurs. |
+| `SWITCH` | The manager plans to load a different model. The following log lines report the launch result. |
+| `WARMING` | A launch was requested; the manager is waiting for Darkbloom to confirm the model is warm. |
+| `DEFERRED` | A model was selected, but a condition such as active work or minimum warm time blocks the launch. |
+| `WAIT` | There is no eligible scored target, or the current model's score is unavailable. |
+
+`Reason` explains the decision. `Candidate` shows progress such as
+`2/3 consecutive checks passed`, alongside `--switch-after-checks`.
+`Earliest switch` is conditional: the candidate must keep passing, the provider
+must be online and idle, and minimum warm time must have elapsed. A wait for
+warm time names `--min-warm-time`; `Deferred` gives the current blocker.
+
+`Discovery` reports the local scan. `Catalog` reports the supported-model list.
+`Prices` shows whether prices were fetched, cached, or retained after a failed
+refresh, with their fetch time.
+
+## How scores work
 
 ```text
 pressure = active requests / max(1, warm providers)
@@ -104,16 +158,11 @@ The score compares models at that assumed mix. It does not measure your
 provider's throughput, actual token mix, or payouts, and does not reproduce
 per-request billing rounding.
 
-| Table column | Meaning |
-| --- | --- |
-| `IN$/M` | Input price per million input tokens. |
-| `OUT$/M` | Output price per million output tokens. |
-| `BLEND$/M` | Price per million total tokens at the fixed 85/15 mix, before pressure and weight. |
-| `WEIGHT` | The model score multiplier, set with `--weight`. |
-| `SCORE` | Average pressure × blended price × weight. |
-
-Price columns show four decimal places. Calculations use the full values.
-`BLEND$/M` replaces the earlier `PROJ$/M` column.
+Samples expire after `check-every × average-samples` seconds, including while
+the manager is stopped. With the defaults of `60` and `15`, the average contains
+at most 15 samples from the past 15 minutes. The table's `N` column shows how many are
+available. Changing either setting clears the old samples and resets the
+number of consecutive passing checks.
 
 | Model ID | Default weight |
 | --- | ---: |
@@ -126,6 +175,18 @@ Price columns show four decimal places. Calculations use the full values.
 Set a weight with `--weight MODEL_ID=WEIGHT`. Repeat it for more models.
 For example, `--weight Qwen3.5-9B=1.25` increases that model's score by 25%.
 Weights must be positive; they can also name ignored models or future downloads.
+
+## Switching rules
+
+| Flag | Default | What it controls |
+| --- | --- | --- |
+| `--check-every SECONDS` | 60 | Seconds between checks. Minimum: 60. |
+| `--average-samples COUNT` | 15 | Maximum number of recent pressure samples to average. |
+| `--switch-after-checks COUNT` | 3 | Consecutive checks the same candidate must pass before switching. |
+| `--min-warm-time SECONDS` | 2700 | Minimum time to keep a warm model before replacing it. |
+
+The old names still work as aliases: `--interval`, `--history`,
+`--confirmations`, and `--min-dwell`, respectively.
 
 Before comparing a candidate with the current model, the manager discounts its
 score for the estimated time lost while switching:
@@ -168,6 +229,14 @@ If no eligible model is currently warm, the manager selects the highest scored
 eligible model without waiting for consecutive passing checks. It still checks
 daemon health, active requests, and pending warm-up. An empty warm list has no minimum
 warm time to preserve; an existing warm selection does.
+
+A live switch runs `darkbloom start` with one `--model` and
+`--idle-timeout 0`. That restarts the provider. Before launching, the manager
+sets `backend.preload_models` to a one-element list containing the selected
+model, preserving the rest of the config text. It waits until fresh daemon
+state confirms exactly that model is warm before starting the minimum warm
+time. A provider restart also starts a new minimum warm period, even if the
+manager's saved switch time is older.
 
 ## Discovery and ignored models
 
@@ -224,20 +293,6 @@ Hiding rows changes only the display. Their timestamped samples, prices, scores,
 and exclusion reasons remain in the state file. Toggling the flag preserves
 passing-check counts and warm-up tracking. The provider-status line still
 reports what is actually warm, even if that model's table row is hidden.
-
-The `MODEL ID` column and decision lines use the exact IDs accepted by
-`--ignore-model`, including capitalization and any namespace prefix.
-
-By default, `Highest raw score` includes ignored and auto-ignored models, with their labels,
-and includes ties. It is measured before
-switch costs and thresholds. The `Decision`, `Candidate`, `Earliest switch`, and
-`Deferred` lines show what the manager can actually do. A saved pending switch
-cannot authorize an ignored model to load.
-
-`Candidate` shows progress such as `2/3 consecutive checks passed`, followed
-by `--switch-after-checks`. A wait for minimum warm time names `--min-warm-time`
-and shows the seconds remaining. `Earliest switch` is conditional: the candidate
-must keep meeting the percentage requirement, and the provider must be idle.
 
 Darkbloom's `--all` bypasses the enabled-model config filter, but its scanner can
 still omit downloads that exceed available memory. The catalog's JSON output
