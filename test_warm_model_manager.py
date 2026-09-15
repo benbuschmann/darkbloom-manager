@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
+from urllib.error import HTTPError, URLError
 
 from warm_model_manager import (
     CapacitySample,
@@ -21,6 +23,8 @@ from warm_model_manager import (
     PRICING_CACHE_SCHEMA,
     STATE_SCHEMA,
     Manager,
+    PROD_PROBE_URL,
+    ProbeRedirectHandler,
     build_score_snapshot,
     build_parser,
     cached_model_prices,
@@ -42,10 +46,12 @@ from warm_model_manager import (
     main,
     migrate_default_state,
     pressure_samples,
+    probe_credentials,
     read_daemon_state,
     reconcile_pending_switch,
     render_preload_model_config,
     revenue_scores,
+    send_probe,
     switch_model,
     switch_block_reason,
     switch_forecast,
@@ -1069,6 +1075,262 @@ class CliAndStateTests(unittest.TestCase):
                 self.assertEqual(json.loads(self.previous_path.read_text()), self.previous)
 
 
+class ProbeTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.state = self.directory / "state.json"
+        self.local = self.directory / "local.json"
+        self.token = self.directory / "prod-token"
+        self.token.write_text("fixture-production-token\n")
+        self.token.chmod(0o600)
+        self.local.write_text(json.dumps({
+            "pid": 123, "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "fixture-local-token",
+        }))
+        self.args = build_parser().parse_args([
+            "run", "--apply", "--hourly-probes", "--state", str(self.state),
+            "--prod-token-file", str(self.token), "--local-endpoint-file", str(self.local),
+        ])
+        self.manager = Manager(self.args)
+        self.warm = LocalDaemonState("good", ("good",), False, 123, 100, True)
+        self.clock = self.mock("time.time", return_value=10000)
+        self.daemon = self.mock("read_daemon_state", return_value=self.warm)
+        self.send = self.mock("send_probe", return_value={"http_status": 200, "status": "response received"})
+        self.saved = {"pressure_history": {"good": [{"at": 10000, "pressure": 1}]},
+                      "live_challenger_streak": 2, "last_switch_at": 9000}
+        self.state.write_text(json.dumps(self.saved))
+
+    def mock(self, name, **kwargs):
+        patcher = patch("warm_model_manager." + name, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def tick(self, at):
+        self.clock.return_value = at
+        with redirect_stdout(io.StringIO()) as output:
+            self.manager.probe_if_due()
+        return json.loads(self.state.read_text()), output.getvalue()
+
+    def test_alternates_hourly_and_reads_changed_warm_model(self):
+        self.tick(10000)
+        self.tick(11799)
+        self.daemon.return_value = replace(self.warm, current_model="new", warm_models=("new",))
+        self.tick(11800)
+        state, report = self.tick(13600)
+        self.assertEqual([(c.args[0], c.args[1]) for c in self.send.call_args_list],
+                         [("local", "good"), ("production", "new"), ("local", "new")])
+        self.assertEqual(state["probes"]["next_at"], 15400)
+        self.assertIn('model="new"; HTTP 200', report)
+        for key, value in self.saved.items():
+            self.assertEqual(state[key], value)
+        self.assertNotIn("fixture-", self.state.read_text() + report)
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
+
+    def test_restart_and_downtime_do_not_burst_or_replay(self):
+        self.tick(10000)
+        self.manager = Manager(self.args)
+        self.tick(10060)
+        self.send.assert_called_once()
+        self.manager = Manager(self.args)
+        state, _ = self.tick(20000)
+        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual(self.send.call_args.args[0], "production")
+        self.assertEqual(state["probes"]["next_at"], 21800)
+        self.tick(20001)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_off_dry_run_and_stopping_do_not_read_credentials_or_advance_schedule(self):
+        for enabled, apply, stopped in ((False, True, False), (True, False, False), (True, True, True)):
+            with self.subTest(enabled=enabled, apply=apply, stopped=stopped):
+                self.args.hourly_probes, self.args.apply = enabled, apply
+                self.manager = Manager(self.args)
+                self.manager.stop_requested = stopped
+                with patch("warm_model_manager.probe_credentials") as credentials:
+                    state, _ = self.tick(10000)
+                credentials.assert_not_called()
+                self.assertEqual(state, self.saved)
+        self.send.assert_not_called()
+        self.assertFalse(build_parser().parse_args([]).hourly_probes)
+
+    def test_skip_unavailable_busy_ignored_and_pending_models(self):
+        cases = [
+            (None, {}, [], "unavailable"),
+            (replace(self.warm, fresh=False), {}, [], "stale"),
+            (replace(self.warm, alive=False), {}, [], "offline"),
+            (replace(self.warm, warm_models=()), {}, [], "no single warm"),
+            (replace(self.warm, warm_models=("good", "other")), {}, [], "no single warm"),
+            (replace(self.warm, inference_active=True), {}, [], "serving"),
+            (self.warm, {}, ["good"], "ignored"),
+            (self.warm, {"pending_switch": {"target": "new"}}, [], "pending"),
+        ]
+        for daemon, saved, ignored, reason in cases:
+            with self.subTest(reason=reason):
+                self.daemon.return_value = daemon
+                self.state.write_text(json.dumps(saved))
+                self.manager = Manager(self.args)
+                self.manager.ignored = set(ignored)
+                state, output = self.tick(10000)
+                self.assertIn(reason, output)
+                self.assertEqual(state["probes"]["next_at"], 11800)
+                self.assertIsNone(state["probes"]["last_result"]["http_status"])
+        self.send.assert_not_called()
+
+    def test_model_restriction_is_also_honored(self):
+        self.args.model = ["other"]
+        _, report = self.tick(10000)
+        self.assertIn("excluded by --model", report)
+        self.send.assert_not_called()
+
+    def test_missing_tokens_do_not_stop_alternating_schedule(self):
+        self.tick(10000)
+        self.token.unlink()
+        _, output = self.tick(11800)
+        self.assertIn("production token unavailable", output)
+        self.tick(13600)
+        self.assertEqual([c.args[0] for c in self.send.call_args_list], ["local", "local"])
+
+    def test_save_before_request_and_interrupt_blocks_replay(self):
+        def interrupt(*_):
+            state = json.loads(self.state.read_text())["probes"]
+            self.assertEqual(state["next_at"], 11800)
+            self.assertEqual(state["last_result"]["status"], "request started; result unknown")
+            raise KeyboardInterrupt
+        self.send.side_effect = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(10000)
+        self.manager = Manager(self.args)
+        self.tick(10001)
+        self.send.assert_called_once()
+
+    def test_failed_state_write_or_corruption_prevents_request(self):
+        with patch("warm_model_manager.write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.tick(10000)
+        self.state.write_text("{damaged")
+        self.manager = Manager(self.args)
+        with self.assertRaises(ValueError):
+            self.tick(10000)
+        self.send.assert_not_called()
+
+    def test_schedule_runs_between_slow_score_checks(self):
+        self.args.check_every = 7200
+        elapsed = [10000.0]
+        self.clock.side_effect = lambda: elapsed[0]
+        def sleep(_):
+            elapsed[0] += 900
+            if elapsed[0] > 13600:
+                self.manager.stop_requested = True
+        with patch.object(self.manager, "iteration") as iteration, \
+                patch("warm_model_manager.time.monotonic", side_effect=lambda: elapsed[0]), \
+                patch("warm_model_manager.time.sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
+            self.manager.run()
+        iteration.assert_called_once()
+        self.assertEqual([c.args[0] for c in self.send.call_args_list], ["local", "production", "local"])
+
+    def test_local_endpoint_rejects_wrong_process_and_nonlocal_urls(self):
+        for base in ("http://example.com:8000/v1", "http://127.0.0.1:8000/v1?x=1",
+                     "http://user:secret@127.0.0.1:8000/v1", "file:///v1", "http://127.0.0.1:bad/v1"):
+            with self.subTest(base=base):
+                self.local.write_text(json.dumps({"pid": 123, "base_url": base, "api_key": "fixture"}))
+                with self.assertRaisesRegex(ValueError, "loopback"):
+                    probe_credentials("local", self.warm, self.local, self.token)
+        self.local.write_text(json.dumps({"pid": 999, "base_url": "http://127.0.0.1:8000/v1"}))
+        with self.assertRaisesRegex(ValueError, "another provider"):
+            probe_credentials("local", self.warm, self.local, self.token)
+
+    def test_local_saved_token_ipv6_and_no_auth_mode(self):
+        url, token = probe_credentials("local", self.warm, self.local, self.token)
+        self.assertEqual(url, "http://127.0.0.1:8000/v1/chat/completions")
+        self.assertEqual(token, "fixture-local-token")
+        self.local.write_text(json.dumps({"pid": 123, "base_url": "http://[::1]:9000/v1/", "api_key": ""}))
+        self.assertEqual(probe_credentials("local", self.warm, self.local, self.token),
+                         ("http://[::1]:9000/v1/chat/completions", ""))
+
+    def test_token_setup_is_private_and_does_not_start_manager(self):
+        self.token.chmod(0o644)
+        with patch("warm_model_manager.getpass.getpass", return_value="replacement-fixture"), \
+                patch.object(sys, "argv", ["manager", "set-prod-token", "--prod-token-file", str(self.token)]), \
+                patch.object(Manager, "run") as run, redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(), 0)
+        run.assert_not_called()
+        self.assertEqual(self.token.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.token.read_text(), "replacement-fixture\n")
+        self.assertNotIn("replacement-fixture", output.getvalue())
+        self.assertEqual(json.loads(self.state.read_text()), self.saved)
+
+    def test_bad_token_and_broad_permissions_fail_without_echoing_secret(self):
+        for value in ("", "fixture\ninjected", "fixture\rheader"):
+            self.token.write_text(value)
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                probe_credentials("production", self.warm, self.local, self.token)
+        self.token.write_text("fixture")
+        self.token.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "owner-only"):
+            probe_credentials("production", self.warm, self.local, self.token)
+
+    def test_requests_have_correct_model_auth_route_and_limits(self):
+        for kind, url, token in (("production", PROD_PROBE_URL, "prod-fixture"),
+                                 ("local", "http://127.0.0.1:8000/v1/chat/completions", "local-fixture")):
+            with self.subTest(kind=kind), patch("warm_model_manager.build_opener") as build:
+                response = build.return_value.open.return_value.__enter__.return_value
+                response.status = 200
+                response.headers = {"X-Provider-Id": "provider-another-mac"}
+                response.read.return_value = b'{"choices": [{"message": {"content": "PRIVATE CONTENT"}}]}'
+                result = send_probe(kind, 'model/with"quote', url, token)
+                request = build.return_value.open.call_args.args[0]
+                headers = {k.lower(): v for k, v in request.header_items()}
+                self.assertEqual(request.full_url, url)
+                self.assertEqual(request.method, "POST")
+                body = json.loads(request.data)
+                self.assertEqual(body["model"], 'model/with"quote')
+                self.assertEqual(body["max_tokens"], 64)
+                self.assertFalse(body["stream"])
+                self.assertEqual(headers["authorization"], "Bearer " + token)
+                self.assertEqual(headers.get("x-darkbloom-route"), "self" if kind == "production" else None)
+                self.assertEqual(result.get("provider_id"), "provider-another-mac" if kind == "production" else None)
+                self.assertEqual(build.call_args.args[0].proxies, {})
+                self.assertIsInstance(build.call_args.args[1], ProbeRedirectHandler)
+                self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 30)
+                response.read.assert_called_once_with(65537)
+                self.assertNotIn("PRIVATE CONTENT", json.dumps(result))
+
+    def test_response_read_failure_preserves_http_status_and_redacts_details(self):
+        with patch("warm_model_manager.build_opener") as build:
+            response = build.return_value.open.return_value.__enter__.return_value
+            response.status = 200
+            response.read.side_effect = TimeoutError("SECRET")
+            result = send_probe("production", "model", PROD_PROBE_URL, "SECRET")
+        self.assertEqual(result["http_status"], 200)
+        self.assertIn("timed out", result["status"])
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_malicious_response_headers_and_oversized_body_are_not_logged(self):
+        for provider in ("SECRET", "provider\nforged log"):
+            with self.subTest(provider=provider), patch("warm_model_manager.build_opener") as build:
+                response = build.return_value.open.return_value.__enter__.return_value
+                response.status = 200
+                response.headers = {"X-Provider-Id": provider}
+                response.read.return_value = b"x" * 65537
+                result = send_probe("production", "model", PROD_PROBE_URL, "SECRET")
+                self.assertNotIn("provider_id", result)
+                self.assertEqual(result["status"], "response exceeded size limit")
+
+    def test_http_errors_and_timeout_are_bounded_and_redacted(self):
+        errors = [HTTPError(PROD_PROBE_URL, n, "SECRET", {}, io.BytesIO(b"SECRET"))
+                  for n in (302, 401, 429, 503)] + [URLError("SECRET"), TimeoutError("SECRET")]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch("warm_model_manager.build_opener") as build:
+                build.return_value.open.side_effect = error
+                result = send_probe("production", "model", PROD_PROBE_URL, "SECRET")
+                self.assertEqual(result["http_status"], getattr(error, "code", None))
+                self.assertNotIn("SECRET", json.dumps(result))
+                build.return_value.open.assert_called_once()
+        self.assertIsNone(ProbeRedirectHandler().redirect_request(None, None, 302, "", {}, "https://other.invalid"))
+
+
 class ManagerIntegrationTests(unittest.TestCase):
     """Exercise full ticks using fake network, discovery, daemon and launch calls."""
     def setUp(self) -> None:
@@ -1115,6 +1377,29 @@ class ManagerIntegrationTests(unittest.TestCase):
 
     def save(self, state):
         self.path.write_text(json.dumps(state))
+
+    def test_normal_checks_preserve_probe_schedule_and_scoring_state(self):
+        state, _ = self.tick()
+        schedule = {"next_kind": "production", "next_at": 11800,
+                    "last_result": {"kind": "local", "at": 10000, "http_status": 200}}
+        state["probes"] = schedule
+        self.save(state)
+        updated, _ = self.tick(10060)
+        self.assertEqual(updated["probes"], schedule)
+        self.assertEqual(updated["last_score_snapshot"]["models"]["good"]["score"],
+                         state["last_score_snapshot"]["models"]["good"]["score"])
+        self.launch.assert_not_called()
+
+    def test_once_sends_one_due_probe_after_confirming_current_model(self):
+        self.args.hourly_probes = True
+        with patch("warm_model_manager.probe_credentials", return_value=("http://127.0.0.1:8000/v1/chat/completions", "fixture")), \
+                patch("warm_model_manager.send_probe", return_value={"http_status": 200, "status": "response received"}) as send, \
+                redirect_stdout(io.StringIO()):
+            self.manager.run()
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[:2], ("local", "good"))
+        self.assertEqual(json.loads(self.path.read_text())["probes"]["next_at"], 11800)
+        self.launch.assert_not_called()
 
     def test_ignored_leader_has_all_math_persisted_but_is_never_selected(self) -> None:
         self.args.hide_ignored = True

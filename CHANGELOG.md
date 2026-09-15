@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Add optional `--hourly-probes`: alternate a local prompt and a production
+  self-route prompt 30 minutes apart, once per hour for each endpoint.
+  Read the currently warm model each time and require `--apply` to send.
+- Save the next probe before sending. Resume after restarts without replaying
+  missed requests. Skip busy, offline, stale, switching or excluded models.
+- Add `set-prod-token` for hidden token entry into a separate owner-only file,
+  plus path overrides for that token and Darkbloom's local endpoint record.
+- Log probe times, models, HTTP results and returned provider IDs. Keep tokens
+  and response bodies out of logs and state. Reject redirects and require the
+  local endpoint to match the running provider process at a loopback address.
+
 ## 0.1.7 — 2026-09-11
 
 - Add `--hide-ignored` to hide ignored and auto-ignored models from the table

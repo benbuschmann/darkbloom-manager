@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import getpass
+import ipaddress
 import json
 import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,10 +34,12 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
 MANAGER_VERSION = "0.1.7"
@@ -57,6 +62,13 @@ DEFAULT_PRICING_URL = os.environ.get(
     "DARKBLOOM_PRICING_URL", "https://api.darkbloom.dev/v1/pricing"
 )
 DEFAULT_STATE_PATH = Path.home() / ".darkbloom" / "warm-model-manager-state.json"
+DEFAULT_PROD_TOKEN_PATH = Path.home() / ".darkbloom" / "warm-model-manager-prod-token"
+DEFAULT_LOCAL_ENDPOINT_PATH = Path(os.environ.get(
+    "DARKBLOOM_LOCAL_DIR", str(Path.home() / ".darkbloom")
+)) / "local.json"
+PROD_PROBE_URL = "https://api.darkbloom.dev/v1/chat/completions"
+PROBE_SPACING = 1800
+PROBE_TIMEOUT = 30
 DEFAULT_PROVIDER_CONFIG_PATH = (
     Path.home() / ".config" / "darkbloom" / "provider.toml"
 )
@@ -76,6 +88,7 @@ MANAGER_STATE_KEYS = {
     "pricing_cache", "pricing_status", "scoring_policy", "selection_policy", "switch_policy", "state_schema",
     "live_challenger_model", "live_challenger_streak",
     "dry_challenger_model", "dry_challenger_streak",
+    "probes",
 }
 
 
@@ -554,6 +567,106 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     )
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
+
+
+def valid_probe_token(token: Any) -> bool:
+    return (isinstance(token, str) and 0 < len(token) <= 8192
+            and all(33 <= ord(c) <= 126 for c in token))
+
+
+def save_prod_token(path: Path) -> None:
+    """Read interactively so credentials never enter command arguments or state."""
+    token = getpass.getpass("Darkbloom production API token: ").strip()
+    if not valid_probe_token(token):
+        raise ValueError("token must be nonempty and contain no whitespace")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".prod-token-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(token + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    log("production token saved with owner-only permissions")
+
+
+class ProbeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                         headers: Any, newurl: str) -> None:
+        # A redirect must not forward either token or escape exclusive self-route.
+        return None
+
+
+def probe_credentials(kind: str, daemon: LocalDaemonState,
+                      local_path: Path, prod_token_path: Path) -> tuple[str, str]:
+    if kind == "production":
+        try:
+            with prod_token_path.open(encoding="utf-8") as stream:
+                mode = os.fstat(stream.fileno()).st_mode
+                if not stat.S_ISREG(mode) or mode & 0o077:
+                    raise ValueError("production token file needs owner-only permissions (chmod 600)")
+                token = stream.read(8193).strip()
+        except OSError:
+            raise ValueError("production token unavailable; run set-prod-token") from None
+        if len(token) > 8192 or not valid_probe_token(token):
+            raise ValueError("production token invalid; run set-prod-token")
+        return PROD_PROBE_URL, token
+
+    info = read_json(local_path)
+    if info.get("pid") != daemon.pid:
+        raise ValueError("local endpoint is unavailable or belongs to another provider process")
+    try:
+        url = urlsplit(info.get("base_url", ""))
+        loopback = ipaddress.ip_address(url.hostname or "").is_loopback
+        valid = (loopback and url.scheme in ("http", "https") and url.port
+                 and not url.username and not url.password and not url.query
+                 and not url.fragment and url.path.rstrip("/") == "/v1")
+    except (ValueError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise ValueError("local endpoint must be a loopback /v1 URL with a port")
+    token = info.get("api_key", "")
+    if token != "" and not valid_probe_token(token):
+        raise ValueError("local endpoint token is invalid")
+    return info["base_url"].rstrip("/") + "/chat/completions", token
+
+
+def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    if kind == "production":
+        headers["X-Darkbloom-Route"] = "self"
+    request = Request(url, data=json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+        "max_tokens": 64, "stream": False,
+    }).encode("utf-8"), headers=headers, method="POST")
+    # In particular, never send a local token through an environment proxy.
+    opener = build_opener(ProxyHandler({}), ProbeRedirectHandler())
+    status = None
+    try:
+        with opener.open(request, timeout=PROBE_TIMEOUT) as response:
+            status = response.status
+            # Finish the small non-streaming response before closing the socket.
+            # Discard its content; bound the read even if the server misbehaves.
+            oversized = len(response.read(65537)) > 65536
+            result = {"http_status": status,
+                      "status": "response exceeded size limit" if oversized else "response received"}
+            provider = response.headers.get("X-Provider-Id", "")
+            if (kind == "production" and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", provider)
+                    and (not token or token not in provider)):
+                result["provider_id"] = provider
+            # Bodies may contain generated text or error details; do not store them.
+            return result
+    except HTTPError as error:
+        code = error.code
+        error.close()
+        return {"http_status": code, "status": "HTTP error"}
+    except (URLError, OSError, ValueError, HTTPException):
+        # Exception messages can echo a credential or URL. Keep only a fixed label.
+        return {"http_status": status, "status": "connection failed or timed out"}
 
 
 def migrate_default_state(state_path: Path) -> bool:
@@ -1352,9 +1465,83 @@ class Manager:
         self.weights.update(args.weight)
         self.state_path: Path = args.state
         self.stop_requested = False
+        self.next_probe_at = 0.0
 
     def stop(self, _signum: int, _frame: Any) -> None:
         self.stop_requested = True
+
+    def probe_if_due(self) -> None:
+        if not self.args.hourly_probes or not self.args.apply or self.stop_requested:
+            return
+        now = time.time()
+        if now < self.next_probe_at:
+            return
+        # Back off on state I/O failures too, without risking an unrecorded request.
+        self.next_probe_at = now + 60
+        manager_state = (json.loads(self.state_path.read_text(encoding="utf-8"))
+                         if self.state_path.exists() else {})
+        if not isinstance(manager_state, dict):
+            raise ValueError("invalid manager state")
+        schedule = manager_state.get("probes")
+        if (not isinstance(schedule, dict)
+                or schedule.get("next_kind") not in ("local", "production")
+                or not isinstance(schedule.get("next_at"), (float, int))
+                or not math.isfinite(schedule["next_at"])):
+            schedule = {"next_kind": "local", "next_at": now}
+        if now < schedule["next_at"]:
+            # A backward wall-clock change must not stall probes indefinitely.
+            self.next_probe_at = min(schedule["next_at"], now + PROBE_SPACING)
+            if self.next_probe_at != schedule["next_at"]:
+                schedule["next_at"] = self.next_probe_at
+                manager_state["probes"] = schedule
+                write_json_atomic(self.state_path, manager_state)
+            return
+
+        kind = schedule["next_kind"]
+        daemon = read_daemon_state(self.args.daemon_state, now=time.time())
+        model = None
+        reason = None
+        if not daemon or not daemon.alive or not daemon.fresh:
+            reason = "provider state is unavailable, stale or offline"
+        elif len(daemon.warm_models) != 1:
+            reason = "no single warm model"
+        else:
+            model = daemon.warm_models[0]
+            if model in self.ignored or (self.args.model is not None and model not in self.args.model):
+                reason = "warm model is ignored or excluded by --model"
+            elif manager_state.get("pending_switch"):
+                reason = "model switch is pending"
+            elif daemon.inference_active:
+                reason = "provider is serving a request"
+        url, token = "", ""
+        if not reason:
+            try:
+                url, token = probe_credentials(kind, daemon, self.args.local_endpoint_file,
+                                               self.args.prod_token_file)
+            except ValueError as error:
+                reason = str(error)  # Only fixed, credential-free messages above.
+        result = {"at": now, "kind": kind, "model": model, "http_status": None,
+                  "status": "skipped: " + reason if reason else "request started; result unknown"}
+        schedule = {
+            "next_kind": "production" if kind == "local" else "local",
+            "next_at": now + PROBE_SPACING,
+            "last_result": result,
+        }
+        manager_state["probes"] = schedule
+        # Commit the next slot before POST: interruption or timeout cannot replay it.
+        # After downtime, try one slot and space the next 30 minutes later.
+        write_json_atomic(self.state_path, manager_state)
+        self.next_probe_at = schedule["next_at"]
+        if not reason and not self.stop_requested:
+            result.update(send_probe(kind, model, url, token))
+            write_json_atomic(self.state_path, manager_state)
+        elif self.stop_requested and not reason:
+            result["status"] = "skipped: manager is stopping"
+            write_json_atomic(self.state_path, manager_state)
+        http_result = f"HTTP {result['http_status']}" if result["http_status"] is not None else "HTTP N/A"
+        served_by = f"; provider={result['provider_id']}" if result.get("provider_id") else ""
+        log(f"{kind} probe: model={json.dumps(model)}; {http_result}; {result['status']}{served_by}")
+        log(f"next probe: {schedule['next_kind']} at {format_local_time(self.next_probe_at, now)}")
 
     def discover_models(self, manager_state: dict[str, Any], now: float) -> set[str]:
         previous = manager_state.get("discovery") or {}
@@ -1647,6 +1834,7 @@ class Manager:
     def run(self) -> None:
         if self.args.mode == "once":
             self.iteration()
+            self.probe_if_due()
             return
         if self.args.apply:
             log(
@@ -1658,12 +1846,19 @@ class Manager:
                 f"manager ({MANAGER_VERSION}) started in DRY-RUN mode; "
                 "add --apply to enable model changes"
             )
+        if self.args.hourly_probes:
+            log("hourly probes enabled: local and production self-route, 30 minutes apart"
+                if self.args.apply else "hourly probes disabled in dry run; --apply is required to send prompts")
         while not self.stop_requested:
             started = time.monotonic()
             try:
                 self.iteration()
             except Exception as error:
                 log(f"manager error: {error}")
+            try:
+                self.probe_if_due()
+            except Exception:
+                log("probe state error; check that the manager state file is writable")
             remaining = max(0.0, self.args.check_every - (time.monotonic() - started))
             if not self.stop_requested:
                 log(
@@ -1672,7 +1867,11 @@ class Manager:
                 )
             deadline = time.monotonic() + remaining
             while not self.stop_requested and time.monotonic() < deadline:
-                time.sleep(min(1.0, deadline - time.monotonic()))
+                try:
+                    self.probe_if_due()
+                except Exception:
+                    log("probe state error; check that the manager state file is writable")
+                time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))
 
 
 def nonnegative_float(value: str) -> float:
@@ -1720,8 +1919,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {MANAGER_VERSION}",
     )
-    parser.add_argument("mode", choices=("once", "run"), nargs="?", default="once")
-    parser.add_argument("--apply", action="store_true", help="actually switch models; default is dry-run")
+    parser.add_argument("mode", choices=("once", "run", "set-prod-token"), nargs="?", default="once")
+    parser.add_argument("--apply", action="store_true", help="enable model changes and opted-in probes; default is dry-run")
+    parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart; requires --apply")
+    parser.add_argument("--prod-token-file", type=Path, default=DEFAULT_PROD_TOKEN_PATH, help="private production token file; save with set-prod-token (default ~/.darkbloom/warm-model-manager-prod-token)")
+    parser.add_argument("--local-endpoint-file", type=Path, default=DEFAULT_LOCAL_ENDPOINT_PATH, help="Darkbloom local endpoint metadata (default ~/.darkbloom/local.json; respects DARKBLOOM_LOCAL_DIR)")
     parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible unless --hide-ignored is set (default: all locally discovered models)")
     parser.add_argument(
         "--ignore-model", "--ignore", action="extend", nargs="+", default=[], metavar="MODEL_ID",
@@ -1769,6 +1971,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    args.prod_token_file = args.prod_token_file.expanduser()
+    args.local_endpoint_file = args.local_endpoint_file.expanduser()
+    args.daemon_state = args.daemon_state.expanduser()
+    if args.mode == "set-prod-token":
+        try:
+            save_prod_token(args.prod_token_file)
+        except (OSError, ValueError, EOFError):
+            log("token was not saved; check the token and destination permissions")
+            return 1
+        except KeyboardInterrupt:
+            return 130
+        return 0
     args.weight = dict(args.weight)
     models = args.model or []
     if len(set(models)) != len(models):

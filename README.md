@@ -80,12 +80,91 @@ Add `--hide-ignored` to hide ignored and auto-ignored models from the table
 and its ranking. Without it, all models remain visible as before.
 
 Without `--apply`, the manager prints decisions and saves its own state. It
-does not launch a model or edit startup preloads. It still reads the catalog
+does not launch a model, edit startup preloads, or send probe prompts. It still reads the catalog
 and local model list through Darkbloom, which may migrate an older provider config.
 
 Add `--config /path/to/provider.toml` if your provider uses a custom config.
 The catalog, local scan, and live launches all use that path. Use
 `--darkbloom /path/to/darkbloom` if the CLI is not on your `PATH`.
+
+## Hourly probes
+
+Add `--hourly-probes` to send a short prompt to the warm model through two
+endpoints. This is optional and requires `--apply`.
+
+| Time after enabling | Request |
+| --- | --- |
+| First check | Local endpoint on this Mac |
+| 30 minutes | Production API with `X-Darkbloom-Route: self` |
+| 60 minutes | Local endpoint again |
+| 90 minutes | Production API again |
+
+Each endpoint gets one attempt per hour. The manager reads the warm model
+again for every attempt, so the requests follow model changes. Each prompt
+asks for `OK`, allows up to 64 output tokens, and has a 30-second socket timeout.
+A reasoning model may use the token limit before writing `OK`.
+
+The local request uses Darkbloom's saved endpoint and local token. The endpoint
+must already be enabled on the running provider. Its process ID must match
+the daemon state, and its address must be loopback. See Darkbloom's
+[local endpoint instructions](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/direct-mode.md).
+The manager does not enable the endpoint or restart Darkbloom to set it up.
+
+Save your production API token once on each Mac:
+
+```sh
+python3 warm_model_manager.py set-prod-token
+```
+
+Paste the token at the hidden prompt. It is saved separately at
+`~/.darkbloom/warm-model-manager-prod-token` with owner-only permissions.
+Use a key from the account that owns your providers. To replace it, run the
+same command again. Tokens are read again for each request.
+
+Then run:
+
+```sh
+python3 warm_model_manager.py run --apply --hourly-probes \
+  --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
+```
+
+Production requests go to `https://api.darkbloom.dev/v1/chat/completions`.
+Self-route restricts them to your account's providers and does not fall back
+to the paid fleet. It can choose another Mac that advertises the same model;
+it cannot pin a request to this computer. The local request reaches this Mac.
+See Darkbloom's [self-route documentation](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/self-route.md).
+
+Logs show the time, endpoint kind, requested model and HTTP result. Production
+logs also show the serving provider ID when the response header includes it:
+
+```text
+2026-09-15 10:00:00-0700 local probe: model="Qwen3.5-9B"; HTTP 200; response received
+2026-09-15 10:30:00-0700 production probe: model="Qwen3.5-9B"; HTTP 200; response received; provider=example-provider
+```
+
+An attempt is skipped if the provider is offline, its state is stale, there
+isn't exactly one warm model, a switch is pending, or it is serving a request.
+Ignored models and models excluded by `--model` are skipped too. Missing tokens
+or an unavailable local endpoint skip that endpoint's turn. Failures are logged
+without response bodies or credentials; there are no immediate retries.
+
+The next endpoint and time survive manager restarts. After downtime, the
+manager handles one overdue turn and schedules the other 30 minutes later.
+It does not replay missed requests. Skipped turns also advance the schedule.
+Score-check timing does not change: probes can run between checks. A slow check
+or an in-progress switch can delay a probe; a probe that runs past the next
+check time delays that check until the request returns. `once --apply --hourly-probes`
+handles at most one due turn, then exits; use `run` for the hourly schedule.
+
+`--prod-token-file PATH` selects another private production token file for
+both setup and requests. `--local-endpoint-file PATH` selects another
+Darkbloom endpoint record. Its default is `~/.darkbloom/local.json`, or
+`$DARKBLOOM_LOCAL_DIR/local.json` when that variable is set. With a custom
+`--config`, also select the matching `--daemon-state` and endpoint record.
+
+These probes test inference. We have not established that they restore network
+assignments or increase earnings. Turning off `--hourly-probes` stops requests;
+the saved schedule remains for the next time you enable it.
 
 ## Read the report
 
@@ -311,9 +390,13 @@ and [model scanner](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95
 
 ### Do I need a Darkbloom API key?
 
-No. The manager reads public capacity and pricing endpoints without an API key.
-It uses your installed Darkbloom CLI and provider config for local operations.
-It does not read a `.env` file. Darkbloom itself must already be configured and
+Scoring and model switching need no API key. The optional
+[hourly probes](#hourly-probes) use Darkbloom's saved local token and a
+production API token you save with `set-prod-token`.
+
+The manager reads public capacity and pricing endpoints and uses your installed
+Darkbloom CLI and provider config for local operations. It does not read a
+`.env` file. Darkbloom itself must already be configured and
 running; follow its [provider setup instructions](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/installation.md).
 
 ### What is saved locally?
@@ -334,10 +417,13 @@ write permissions.
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
 | Percentage requirement, switch cost, and decision horizon | Reset passing-check counts when the switch rule changes. |
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
+| Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's time, requested model, HTTP status, skip reason and serving provider ID when available. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
-The manager does not collect prompts, responses, API keys,
-local request counts, or per-model request rates. Catalog, discovery, and launch errors
+The state file contains no prompts, response bodies or API keys. The production
+token lives in its separate private file; the local token stays in Darkbloom's
+endpoint record. Probe logs go to the terminal. The manager does not collect
+local request counts or per-model request rates. Catalog, discovery, and launch errors
 can contain local paths or CLI error text.
 
 Use `--state /path/to/state.json` for another location. On the first run with

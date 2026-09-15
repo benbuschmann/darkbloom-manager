@@ -17,6 +17,7 @@ config*.toml
 *.private.json
 *.local.json
 auth_token
+warm-model-manager-prod-token
 
 # Local provider state, locks, logs and observations
 .darkbloom/
