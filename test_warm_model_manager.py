@@ -94,7 +94,7 @@ def timeline_lines(state, now, enabled=True, apply=True):
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.10")
+        self.assertEqual(MANAGER_VERSION, "0.1.11")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -1630,6 +1630,9 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.stop = self.mock("stop_provider")
         self.launch = self.mock("switch_model")
         self.discovery = self.mock("local_model_ids", return_value={"good"})
+        self.catalog = self.mock("catalog_model_ids", return_value={"good"})
+        self.capacity = self.mock("fetch_capacity", return_value={"good": CapacitySample("good", 1, 1, 1)})
+        self.prices = self.mock("fetch_model_prices", return_value=({"good": ModelPrice(1, 1)}, ModelPrice(None, None)))
         self.send = self.mock("send_probe", side_effect=lambda kind, *args: self.ok() if kind == "local" else self.failure())
 
     def mock(self, name, **kwargs):
@@ -1723,6 +1726,308 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.assertEqual(self.launch.call_args.args, ("darkbloom", "good", self.config, set()))
         self.assertIn("--local-endpoint", self.launch.call_args.kwargs["local_flags"])
         self.assertEqual(self.config.read_text(), '[backend]\npreload_models = ["good"]\n')
+
+    def new_winner(self):
+        self.discovery.return_value = {"good", "better"}
+        self.catalog.return_value = {"good", "better"}
+        self.capacity.return_value = {
+            "good": CapacitySample("good", 1, 1, 1),
+            "better": CapacitySample("better", 1, 3, 3),
+        }
+        self.prices.return_value = ({"good": ModelPrice(1, 1), "better": ModelPrice(0.5, 0.5)}, ModelPrice(None, None))
+
+    def test_recovery_first_check_replaces_old_winner_and_resets_selection_state(self):
+        self.stopped()
+        self.new_winner()
+        self.args.average_samples = 1000  # Old samples would still fit this long window.
+        self.args.min_warm_time = 99999
+        self.args.switch_after_checks = 100
+        self.args.switch_improvement_percent = 10000
+        self.args.switch_cost = 3599
+        state = json.loads(self.path.read_text())
+        state.update(pressure_history={"good": [{"at": 11500, "pressure": 10000}]},
+                     current_residency={"target": "good"}, current_model="good", active_target="good",
+                     last_switch_at=11500, live_challenger_model="good", live_challenger_streak=99,
+                     dry_challenger_model="good", dry_challenger_streak=99,
+                     probes={"next_kind": "production", "next_at": 13000})
+        ensure_pressure_cadence(state, self.args.check_every, self.args.average_samples)
+        state["pressure_history"] = {"good": [{"at": 11500, "pressure": 10000}]}
+        ensure_scoring_policy(state)
+        # Force refresh even for a valid, recent/future-dated price cache.
+        state["pricing_cache"] = {"schema": PRICING_CACHE_SCHEMA, "source": self.args.pricing_url,
+                                  "fetched_at": 20000, "prices": {"good": ModelPrice(100, 100).to_dict()},
+                                  "fallback": ModelPrice(0, 0).to_dict()}
+        self.path.write_text(json.dumps(state))
+        self.manager = Manager(self.args)
+        self.manager.weights["better"] = 2
+        recovery, output = self.tick(12415)
+        self.assertEqual(recovery["phase"], "starting")
+        self.assertEqual(recovery["model"], "better")
+        self.assertEqual(recovery["previous_model"], "good")
+        self.assertTrue(recovery["attempted"])
+        self.assertIn("fresh recovery check selected better (score 3)", output)
+        self.launch.assert_called_once_with("darkbloom", "better", self.config, set(), local_flags=ANY)
+        self.prices.assert_called_once_with(self.args.pricing_url)
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["pending_switch"]["warm_models"], ["better"])
+        self.assertEqual(state["probes"], {"next_kind": "production", "next_at": 13000})
+        self.assertEqual(state["pressure_history"]["good"], [{"at": 12415, "pressure": 1}])
+        self.assertEqual(state["pressure_history"]["better"], [{"at": 12415, "pressure": 3}])
+        row = state["last_score_snapshot"]["models"]["better"]
+        self.assertEqual(row["score"], 3)
+        self.assertEqual(row["weight"], 2)
+        for key in ("live_challenger_model", "live_challenger_streak", "dry_challenger_model",
+                    "dry_challenger_streak", "last_switch_at", "current_residency", "active_target"):
+            self.assertNotIn(key, state)
+
+    def test_recovery_keeps_excluded_scores_but_only_starts_a_downloaded_allowed_model(self):
+        self.stopped()
+        self.new_winner()
+        self.discovery.return_value |= {"ignored", "outside"}
+        self.catalog.return_value |= {"ignored", "outside", "remote"}
+        for model in ("ignored", "outside", "remote"):
+            self.capacity.return_value[model] = CapacitySample(model, 1, 1000, 1000)
+            self.prices.return_value[0][model] = ModelPrice(10, 10)
+        self.args.ignore_model = ["ignored"]
+        self.args.model = ["good", "better", "ignored", "remote"]
+        self.manager = Manager(self.args)
+        self.tick(12415)
+        self.assertEqual(self.launch.call_args.args[1], "better")
+        rows = json.loads(self.path.read_text())["last_score_snapshot"]["models"]
+        for model in ("ignored", "outside", "remote"):
+            self.assertEqual(rows[model]["score"], 10000)
+            self.assertFalse(rows[model]["eligible"])
+
+    def test_recovery_can_choose_replacement_when_old_model_is_removed_or_ignored(self):
+        self.stopped()
+        original = self.path.read_text()
+        self.new_winner()
+        for ignored in (False, True):
+            self.path.write_text(original)
+            self.manager = Manager(self.args)
+            if ignored:
+                self.manager.ignored.add("good")
+            else:
+                self.discovery.return_value = {"better"}
+            self.launch.reset_mock()
+            recovery, _ = self.tick(12415)
+            self.assertEqual(recovery["model"], "better")
+            self.launch.assert_called_once()
+
+    def test_recovery_waits_for_fresh_data_then_retries_without_another_stop(self):
+        self.stopped()
+        original = json.loads(self.path.read_text())
+        ensure_scoring_policy(original)
+        original["pricing_cache"] = {"schema": PRICING_CACHE_SCHEMA, "source": self.args.pricing_url,
+                                     "fetched_at": 12400, "prices": {"good": ModelPrice(100, 100).to_dict()},
+                                     "fallback": ModelPrice(None, None).to_dict()}
+        for failing in (self.discovery, self.capacity, self.prices):
+            with self.subTest(failing=failing):
+                self.path.write_text(json.dumps(original))
+                self.manager = Manager(self.args)
+                self.launch.reset_mock()
+                failing.side_effect = OSError("fixture unavailable")
+                recovery, output = self.tick(12415)
+                self.assertEqual(recovery["phase"], "offline")
+                self.assertEqual(recovery["selection_check_at"], 12475)
+                self.assertIn("staying offline", output)
+                self.launch.assert_not_called()
+                self.assertNotIn("pending_switch", json.loads(self.path.read_text()))
+                attempts = failing.call_count
+                self.manager = Manager(self.args)  # Saved cadence survives process restart.
+                self.tick(12430)
+                self.assertEqual(failing.call_count, attempts)
+                failing.side_effect = None
+                self.tick(12475)
+                self.launch.assert_called_once()
+        self.stop.assert_called_once()
+
+    def test_empty_eligible_set_can_recover_after_a_download(self):
+        self.stopped()
+        self.discovery.return_value = set()
+        self.tick(12415)
+        self.launch.assert_not_called()
+        self.new_winner()
+        recovery, _ = self.tick(12475)
+        self.assertEqual(recovery["model"], "better")
+        self.launch.assert_called_once()
+        self.stop.assert_called_once()
+
+    def test_unavailable_catalog_does_not_block_locally_verified_fresh_scores(self):
+        self.stopped()
+        self.new_winner()
+        self.catalog.side_effect = OSError("catalog unavailable")
+        self.tick(12415)
+        self.assertEqual(self.launch.call_args.args[1], "better")
+        self.discovery.assert_called_with("darkbloom", self.config)
+        self.catalog.assert_called_with("darkbloom", self.config)
+
+    def test_recovery_checks_winner_again_after_slow_score_fetch(self):
+        self.stopped()
+        self.new_winner()
+        self.discovery.side_effect = [{"good", "better"}, {"good"}]
+        recovery, _ = self.tick(12415)
+        self.assertEqual(recovery["phase"], "offline")
+        self.assertIn("no longer allowed or locally available", recovery["reason"])
+        self.launch.assert_not_called()
+        self.discovery.side_effect = None
+        recovery, _ = self.tick(12475)
+        self.assertEqual(recovery["model"], "better")
+        self.launch.assert_called_once()
+
+    def test_external_start_config_edit_and_cancel_during_scoring_prevent_launch(self):
+        self.stopped()
+        original = self.path.read_text()
+        changes = [lambda: setattr(self.daemon, "return_value", replace(self.warm, pid=999)),
+                   lambda: self.config.write_text('[backend]\npreload_models = ["external"]\n'),
+                   lambda: self.manager.stop(None, None)]
+        for change in changes:
+            self.path.write_text(original)
+            self.config.write_text('[backend]\npreload_models = ["good"]\n')
+            self.daemon.return_value = None
+            self.manager = Manager(self.args)
+            def fetch():
+                change()
+                return {"good": CapacitySample("good", 1, 1, 1)}
+            self.capacity.side_effect = lambda *args: fetch()
+            self.tick(12415)
+            self.launch.assert_not_called()
+            self.assertNotIn("pending_switch", json.loads(self.path.read_text()))
+        self.stop.assert_called_once()
+
+    def test_new_winner_is_saved_before_interrupted_launch_and_warmup_confirms_it(self):
+        self.stopped()
+        self.new_winner()
+        self.launch.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(12415)
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["pending_switch"]["target"], "better")
+        self.assertEqual(state["routing_recovery"]["model"], "better")
+        self.manager = Manager(self.args)
+        self.tick(12430)
+        self.launch.assert_called_once()
+        self.daemon.return_value = replace(self.warm, current_model="better", warm_models=("better",),
+                                          pid=124, started_at=12415)
+        recovery, _ = self.tick(12445)
+        self.assertEqual(recovery["phase"], "verifying")
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["last_switch_at"], 12445)
+        self.assertEqual(state["active_target"], "better")
+        self.assertNotIn("pending_switch", state)
+        self.assertEqual(recovery["next_check_at"], 12625)
+        self.launch.assert_called_once()
+
+    def test_new_winner_uses_real_single_model_preload_sync_with_mocked_cli(self):
+        self.stopped()
+        self.new_winner()
+        self.config.write_text('# keep this comment\n[backend]\npreload_models = ["good"]\n')
+        state = json.loads(self.path.read_text())
+        state["routing_recovery"]["config_digest"] = manager_module.recovery_config_digest(self.config)
+        self.path.write_text(json.dumps(state))
+        self.launch.side_effect = switch_model
+        with patch("warm_model_manager.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as command:
+            self.tick(12415)
+        self.assertIn('preload_models = ["better"]', self.config.read_text())
+        self.assertIn('# keep this comment', self.config.read_text())
+        args = command.call_args.args[0]
+        self.assertEqual(args[args.index('--model') + 1], 'better')
+        self.assertIn('--local-endpoint', args)
+        self.assertIn(str(self.config), args)
+
+    def test_fresh_selection_wait_and_score_reset_are_recovery_only(self):
+        self.stopped()
+        self.args.apply = False
+        before = self.path.read_text()
+        self.tick(12415)
+        self.assertEqual(self.path.read_text(), before)
+        self.capacity.assert_not_called()
+        self.prices.assert_not_called()
+        self.launch.assert_not_called()
+
+
+    def test_warm_recovery_resumes_scoring_and_preserves_new_warm_time(self):
+        self.stopped()
+        self.new_winner()
+        self.tick(12415)
+        self.daemon.return_value = replace(self.warm, current_model="better", warm_models=("better",),
+                                          pid=124, started_at=12415)
+        self.tick(12430)
+        self.capacity.return_value["good"] = CapacitySample("good", 1, 100, 100)
+        for now in (12430, 12490, 12550):
+            self.now.return_value = now
+            with redirect_stdout(io.StringIO()) as output:
+                self.manager.iteration()
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["routing_recovery"]["phase"], "verifying")
+        self.assertTrue(state["routing_recovery"]["attempted"])
+        self.assertEqual(state["last_decision_target"], "good")
+        self.assertEqual(state["live_challenger_streak"], 3)
+        self.assertEqual(state["last_switch_at"], 12430)
+        self.assertEqual(state["current_residency"]["warm_since"], 12430)
+        self.assertIn("minimum warm time", output.getvalue())
+        self.assertIn("Highest raw score", output.getvalue())
+        self.assertIn("score checks continue", output.getvalue())
+        self.assertNotIn("no fresh ranking", output.getvalue())
+        self.assertEqual(len(state["pressure_history"]["better"]), 4)
+        self.launch.assert_called_once()  # Cold start only; the new warm time still blocks switching.
+        self.stop.assert_called_once()
+        before = self.send.call_count
+        self.manager.probe_if_due()
+        self.assertEqual(self.send.call_count, before)  # Recovery owns the probes until verification ends.
+
+    def test_disabled_recovery_cannot_bypass_saved_verification(self):
+        self.restart()
+        original = self.path.read_text()
+        self.capacity.reset_mock()
+        for apply, enabled in ((False, True), (True, False)):
+            self.args.apply, self.args.recover_routing = apply, enabled
+            self.manager = Manager(self.args)
+            with redirect_stdout(io.StringIO()) as output:
+                self.manager.iteration()
+            self.assertIn("saved recovery is paused", output.getvalue())
+            self.assertEqual(self.path.read_text(), original)
+            self.capacity.assert_not_called()
+        self.launch.assert_called_once()
+
+    def test_normal_switch_during_verification_does_not_rearm_shutdown(self):
+        self.restart()
+        self.new_winner()
+        self.args.min_warm_time = 0
+        self.args.switch_after_checks = 1
+        self.args.pricing_refresh = 60
+        self.now.return_value = 12500
+        with redirect_stdout(io.StringIO()):
+            self.manager.iteration()
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["pending_switch"]["target"], "better")
+        recovery, _ = self.tick(12515)
+        self.assertEqual(recovery["phase"], "locked")
+        self.assertTrue(recovery["attempted"])
+        self.stop.assert_called_once()
+        self.assertEqual(self.launch.call_count, 2)  # One recovery start, one allowed normal switch.
+
+    def test_zero_scores_use_normal_initial_tie_order(self):
+        self.stopped()
+        self.new_winner()
+        self.args.model = ["better", "good"]
+        self.capacity.return_value = {name: CapacitySample(name, 1, 0, 0) for name in ("good", "better")}
+        self.manager = Manager(self.args)
+        self.tick(12415)
+        self.assertEqual(self.launch.call_args.args[1], "better")
+
+    def test_recovery_does_not_fetch_selection_data_until_full_offline_wait(self):
+        self.stopped()
+        self.capacity.assert_not_called()
+        self.prices.assert_not_called()
+        self.tick(12414)
+        self.capacity.assert_not_called()
+        self.prices.assert_not_called()
+        self.tick(12429)
+        self.capacity.assert_called_once()
+        self.prices.assert_called_once()
+        self.launch.assert_called_once()
+
 
     def test_clock_jump_cannot_shorten_offline_wait(self):
         self.stopped()
@@ -1869,7 +2174,7 @@ class RoutingRecoveryTests(unittest.TestCase):
             self.stopped()
             change()
             recovery, _ = self.tick(12415)
-            self.assertEqual(recovery["phase"], "locked")
+            self.assertEqual(recovery["phase"], "offline")
             self.launch.assert_not_called()
         self.path.unlink()
         self.manager = Manager(self.args)
@@ -1891,7 +2196,7 @@ class RoutingRecoveryTests(unittest.TestCase):
             self.stopped()
             change()
             recovery, _ = self.tick(12415)
-            self.assertEqual(recovery["phase"], "locked")
+            self.assertEqual(recovery["phase"], "locked" if self.discovery.return_value else "offline")
             self.launch.assert_not_called()
 
     def test_stop_and_start_interruptions_are_not_replayed(self):
@@ -2203,7 +2508,7 @@ class TimelineReportTests(unittest.TestCase):
     def test_recovery_does_not_promise_checks_after_its_verification_deadline(self):
         self.state["routing_recovery"].update(phase="verifying", verify_by=10080)
         events, _ = self.timeline()
-        self.assertEqual([event.at for event in events], [10060, 10080])
+        self.assertEqual([event.at for event in events], [10060, 10080, 10120])
         self.assertFalse(any("recovery check," in event.text for event in events))
 
     def test_dry_run_shows_conditional_selection_but_no_sending_or_recovery(self):
@@ -2224,6 +2529,14 @@ class TimelineReportTests(unittest.TestCase):
         self.assertIn("no fresh ranking", text)
         self.assertNotIn("Highest raw score", text)
 
+    def test_offline_recovery_timeline_shows_fresh_selection_and_retry_time(self):
+        self.state["routing_recovery"].update(phase="offline", restart_at=9900,
+                                             selection_check_at=10080, model="old-model")
+        events, _ = self.timeline()
+        self.assertEqual([event.at for event in events], [10060, 10080])
+        self.assertIn("check fresh scores, then start the highest eligible model", events[1].text)
+        self.assertNotIn("old-model", events[1].text)
+
     def test_saved_recovery_without_enabled_live_run_promises_no_restart(self):
         self.state["routing_recovery"].update(phase="offline", restart_at=10900, model="warm")
         for apply, enabled in ((False, True), (True, False)):
@@ -2235,8 +2548,8 @@ class TimelineReportTests(unittest.TestCase):
     def test_recovery_verification_deadline_is_in_time_order(self):
         self.state["routing_recovery"].update(phase="verifying", verify_by=10200)
         events, _ = self.timeline()
-        self.assertEqual([event.at for event in events], [10060, 10090, 10200])
-        self.assertIn("no second restart", events[-1].text)
+        self.assertEqual([event.at for event in events], [10060, 10090, 10120, 10200])
+        self.assertIn("no repeat recovery shutdown", events[-1].text)
 
     def test_long_minimum_rounds_to_real_check_cadence(self):
         at = switch_ready_at("warm", self.decision, {}, self.daemon,

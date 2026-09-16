@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.11 — 2026-09-16
+
+- After the 15-minute recovery wait, run a fresh score check and start the
+  highest-scoring eligible model instead of always restarting the stopped model.
+- Reset old pressure averages, passing-check counts and warm residency. Refresh
+  local discovery, network pressure and both prices; keep model weights and
+  ignore rules. Use the same scoring path as normal checks.
+- If fresh selection data is unavailable or no model is eligible, remain offline
+  and retry at `--check-every`. Do not launch from stale prices or old scores.
+- Recheck the winner, provider process and config before launch. Save the chosen
+  target before starting, keep single-model preload synchronization, and retain
+  protection against repeated launch commands or recovery shutdowns.
+- Resume normal score checks after confirmed warm-up, with a new minimum warm
+  time. Continue routing verification alongside scoring; keep regular probes
+  paused until verification ends.
+- Update the timeline, README and offline tests for fresh selection, missing
+  data, changed eligibility, interrupted launches and normal scoring after warm-up.
+
 ## 0.1.10 — 2026-09-16
 
 - Put `now`, `next`, `score` and `sources` in a left gutter. Show score checks,

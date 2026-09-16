@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.10"
+MANAGER_VERSION = "0.1.11"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -123,6 +123,17 @@ class ModelPrice:
 
     def to_dict(self) -> dict[str, float | None]:
         return {"input_usd": self.input_usd, "output_usd": self.output_usd}
+
+
+@dataclass(frozen=True)
+class ScoreCheck:
+    samples: dict[str, CapacitySample]
+    averages: dict[str, float]
+    prices: dict[str, ModelPrice]
+    scores: dict[str, float]
+    local_eligible: list[str]
+    eligible: list[str]
+    discovery_available: bool
 
 
 @dataclass(frozen=True)
@@ -215,6 +226,7 @@ def cached_model_prices(
     pricing_url: str,
     now: float,
     refresh_seconds: float,
+    force_refresh: bool = False,
 ) -> dict[str, ModelPrice]:
     cache = manager_state.get("pricing_cache")
     cache = cache if isinstance(cache, dict) else {}
@@ -235,7 +247,7 @@ def cached_model_prices(
     } if isinstance(entries, dict) else {}
     fallback = decode(cache.get("fallback"))
     status = "cached"
-    if not cached_at or now - cached_at >= refresh_seconds:
+    if force_refresh or not cached_at or now - cached_at >= refresh_seconds:
         try:
             live_prices, live_fallback = fetch_model_prices(pricing_url)
         except Exception as error:
@@ -882,11 +894,18 @@ def routing_recovery(state: dict[str, Any]) -> dict[str, Any]:
             or value.get("phase") not in RECOVERY_ACTIVE_PHASES | {"monitoring", "locked"}
             or type(value.get("attempted")) is not bool):
         raise ValueError("invalid routing recovery state; inspect it before enabling changes")
-    for field in ("next_check_at", "warm_since", "command_at", "restart_at", "stopped_monotonic", "verify_by"):
+    for field in ("next_check_at", "warm_since", "command_at", "restart_at", "stopped_monotonic", "verify_by", "selection_check_at"):
         if field in value and (type(value[field]) not in (int, float)
                               or not math.isfinite(value[field]) or value[field] < 0):
             raise ValueError("invalid routing recovery timing; inspect saved state")
     return value
+
+
+def recovery_blocks_selection(state: dict[str, Any], enabled: bool, apply: bool) -> bool:
+    phase = routing_recovery(state).get("phase")
+    # Once warm, ordinary scoring runs alongside routing verification. Saved
+    # recovery still requires explicit live opt-in to resume any model changes.
+    return phase in RECOVERY_ACTIVE_PHASES and (phase != "verifying" or not enabled or not apply)
 
 
 def warm_selection_matches(
@@ -1455,16 +1474,17 @@ def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
     recovery = routing_recovery(state)
     phase = recovery.get("phase")
     recovering = phase in RECOVERY_ACTIVE_PHASES
+    blocking = recovery_blocks_selection(state, recover_routing, apply)
     continuous = next_check is not None
     if continuous:
         check_at = max(now, next_check)
-        text = "refresh recovery status; score checks paused" if recovering else "check scores"
-        ready_at = None if recovering or state.get("pending_switch") else switch_ready_at(
+        text = "refresh recovery status; score checks paused" if blocking else "check scores"
+        ready_at = None if blocking or state.get("pending_switch") else switch_ready_at(
             current, decision, state, daemon, now, check_at, interval, confirmations, minimum)
         contender = decision.challenger or decision.target
-        if not recovering and (decision.warming or state.get("pending_switch")):
+        if not blocking and (decision.warming or state.get("pending_switch")):
             text = "check pending model warm-up"
-        elif not recovering and decision.challenger and decision.target == current and decision.challenger_streak > 0:
+        elif not blocking and decision.challenger and decision.target == current and decision.challenger_streak > 0:
             count = min(confirmations, decision.challenger_streak + 1)
             text = f"check {count} of {confirmations} for {contender}"
         switch_verb = "would switch" if not apply else "switch"
@@ -1473,22 +1493,26 @@ def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
             text += f"; earliest {switch_verb} {condition}"
         elif ready_at is not None:
             events.append(TimelineEvent(ready_at, f"earliest {switch_verb} to {contender}, {condition}", True))
-        events.append(TimelineEvent(check_at, text, bool(decision.challenger) and not recovering))
+        events.append(TimelineEvent(check_at, text, bool(decision.challenger) and not blocking))
     else:
         notes.append("one check only; no recurring events scheduled")
 
-    if recovering:
+    if blocking:
         notes.append("model switching and regular/after-switch probes paused during routing recovery")
+    elif recovering:
+        notes.append("regular/after-switch probes paused during routing verification; score checks continue")
     if recover_routing and apply and continuous:
         if phase == "offline":
-            at = recovery["restart_at"]
-            events.append(TimelineEvent(at, f"restart {recovery['model']}; {format_duration(max(0, at - now))} remaining after confirmed stop", True))
+            at = max(recovery["restart_at"], recovery.get("selection_check_at", 0))
+            remaining = recovery["restart_at"] - now
+            wait = f"; {format_duration(remaining)} remaining after confirmed stop" if remaining > 0 else ""
+            events.append(TimelineEvent(at, "check fresh scores, then start the highest eligible model" + wait, True))
         elif phase in {"monitoring", "checking", "verifying"} and recovery.get("next_check_at") is not None:
             deadline = recovery.get("verify_by") if phase == "verifying" else None
             if deadline is None or max(now, recovery["next_check_at"]) < deadline:
                 events.append(TimelineEvent(recovery["next_check_at"], "recovery check, local then production self-route"))
             if phase == "verifying" and recovery.get("verify_by") is not None:
-                events.append(TimelineEvent(recovery["verify_by"], "recovery verification deadline; no second restart"))
+                events.append(TimelineEvent(recovery["verify_by"], "recovery verification deadline; no repeat recovery shutdown"))
         elif phase in {"starting", "stopping"}:
             notes.append("waiting for confirmed " + ("warm-up" if phase == "starting" else "shutdown; 15m offline wait starts then"))
         elif not recovery:
@@ -1583,7 +1607,7 @@ def print_report(
     warm_models = daemon.warm_models if daemon and daemon.alive and daemon.fresh else ()
     warm = warm_models[0] if len(warm_models) == 1 else None
     recovery = routing_recovery(manager_state)
-    recovering = recovery.get("phase") in RECOVERY_ACTIVE_PHASES
+    recovering = recovery_blocks_selection(manager_state, recover_routing, apply)
     selection_ready = warm_selection_matches(daemon, decision.target)
     if recovering:
         action = "RECOVERY " + recovery["phase"].upper()
@@ -1809,7 +1833,7 @@ class Manager:
                 return
             if phase == "stopping":
                 recovery.update(restart_at=time.time() + RECOVERY_OFFLINE_TIME, stopped_monotonic=time.monotonic())
-                save("provider stopped; waiting 15 minutes before starting the same model", "offline")
+                save("provider stopped; waiting 15 minutes before a fresh model selection", "offline")
                 return
             # A forward wall-clock adjustment must not shorten the wait. A
             # reboot resets monotonic time; conservatively wait again then.
@@ -1823,25 +1847,49 @@ class Manager:
                     recovery["restart_at"] = now + RECOVERY_OFFLINE_TIME - elapsed
                     save("wall clock moved; offline countdown still uses elapsed time")
                 return
-            if not permitted(recovery["model"]):
-                save("saved model is ignored or excluded; restart cancelled", "locked")
+            if now < recovery.get("selection_check_at", 0):
                 return
             if recovery_config_digest(self.args.config) != recovery["config_digest"]:
                 save("provider config changed during recovery; restart cancelled", "locked")
                 return
-            if recovery["model"] not in local_model_ids(self.args.darkbloom, self.args.config):
-                save("saved model is no longer locally available; restart cancelled", "locked")
+            # Commit the retry cadence before any slow reads. No old averages,
+            # passing checks or price cache may choose this cold-start model.
+            recovery["selection_check_at"] = now + self.args.check_every
+            save("offline wait complete; checking fresh scores for a new start")
+            check = self.refresh_scores(state, time.time(), fresh_start=True)
+            if not check.eligible:
+                save("no eligible model with fresh pressure and prices; staying offline until the next score check")
                 return
-            # Slow discovery may race an external start. Never restart it.
-            if provider_services() or process_alive(recovery["pid"]):
-                save("provider service appeared before restart; recovery cancelled", "locked")
+            decision = choose_scored_target(
+                check.eligible, check.scores, None, None, 0,
+                self.args.switch_improvement_percent, self.args.switch_after_checks,
+                self.args.switch_cost, self.args.decision_horizon)
+            target = decision.target
+            # A download/removal, config edit or external start can race the
+            # network reads. Check again before recording any launch intent.
+            if not permitted(target) or target not in self.discover_models(state, time.time()):
+                save("selected model is no longer allowed or locally available; staying offline until the next score check")
+                return
+            if recovery_config_digest(self.args.config) != recovery["config_digest"]:
+                save("provider config changed during score check; restart cancelled", "locked")
+                return
+            services = provider_services()
+            fresh_daemon = read_daemon_state(self.args.daemon_state, now=time.time())
+            if services or process_alive(recovery["pid"]) or (fresh_daemon and fresh_daemon.alive):
+                save("provider appeared before restart; recovery cancelled", "locked")
                 return
             if self.stop_requested:
                 return
-            recovery.update(phase="starting", command_at=time.time())
-            state["pending_switch"] = {"target": recovery["model"], "warm_models": [recovery["model"]],
+            recovery.update(previous_model=recovery["model"], model=target,
+                            phase="starting", command_at=time.time())
+            recovery.pop("selection_check_at", None)
+            state.update(last_decision_at=recovery["command_at"], last_decision_target=target,
+                         last_decision_reason="fresh recovery start: " + decision.reason,
+                         manager_version=MANAGER_VERSION)
+            state["pending_switch"] = {"target": target, "warm_models": [target],
                                        "command_at": recovery["command_at"]}
-            save("starting the saved model; launch will not be retried")
+            save(f"fresh recovery check selected {target} (score {check.scores[target]:.6g}); "
+                 f"previous model {recovery['previous_model']}; starting once, no launch retry")
             try:
                 switch_model(self.args.darkbloom, recovery["model"], self.args.config, self.ignored,
                              local_flags=recovery["local_flags"])
@@ -1862,7 +1910,7 @@ class Manager:
                 recovery.update(pid=daemon.pid, started_at=daemon.started_at, last_requests=0,
                                 reconnect_count=daemon.reconnect_count, warm_since=now,
                                 verify_by=now + RECOVERY_VERIFY_TIME, next_check_at=now + SWITCH_PROBE_DELAY)
-                save("model warm; checking routing in 3 minutes; awaiting this provider's network requests", "verifying")
+                save("model warm; normal score checks resumed; checking routing in 3 minutes", "verifying")
                 if traffic(daemon):
                     recovered(daemon)
             elif now - recovery["command_at"] >= self.args.warmup_timeout:
@@ -2125,12 +2173,98 @@ class Manager:
             }
         return catalog
 
+    def refresh_scores(self, manager_state: dict[str, Any], now: float,
+                       fresh_start: bool = False) -> ScoreCheck:
+        """Use one scoring/eligibility path for ordinary checks and recovery starts."""
+        if fresh_start:
+            manager_state["pressure_history"] = {}
+            manager_state["state_schema"] = STATE_SCHEMA
+            for key in ("live_challenger_model", "live_challenger_streak",
+                        "dry_challenger_model", "dry_challenger_streak",
+                        "challenger_model", "challenger_streak", "current_residency",
+                        "current_model", "active_target", "last_switch_at", "pending_switch",
+                        "switch_probe", "last_decision_at", "last_decision_target", "last_decision_reason"):
+                manager_state.pop(key, None)
+            ensure_pressure_cadence(manager_state, self.args.check_every, self.args.average_samples)
+            ensure_preload_sync_policy(manager_state)
+            ensure_scoring_policy(manager_state)
+            ensure_switch_policy(manager_state, self.args.switch_improvement_percent,
+                                 self.args.switch_cost, self.args.decision_horizon)
+        catalog = self.discover_catalog(manager_state, now)
+        local = self.discover_models(manager_state, now)
+        discovery_available = manager_state["discovery"]["status"] == "live"
+        try:
+            samples = fetch_capacity(self.args.base_url)
+        except Exception as error:
+            samples = {}
+            log(f"network capacity unavailable: {error}")
+
+        # The catalog and capacity feed expand the saved inventory only. They cannot
+        # authorize loading a model absent from a successful local scan.
+        visible = catalog | set(samples) | set(manager_state["discovery"].get("models") or []) | self.ignored
+        self.models = list(dict.fromkeys([
+            *(self.args.model or []), *ordered_model_ids(visible - self.ignored),
+            *self.args.ignore_model,
+        ]))
+        local_eligible = eligible_local_targets(
+            self.args.model if self.args.model is not None else self.models,
+            local, self.ignored,
+        )
+        reconcile_selection_policy(
+            manager_state, local_eligible, self.ignored,
+            discovery_available,
+        )
+        history, averages = update_pressure_history(
+            self.models,
+            samples,
+            manager_state.get("pressure_history") or {},
+            self.args.average_samples,
+            now,
+            self.args.check_every * self.args.average_samples,
+        )
+        prices = cached_model_prices(
+            manager_state,
+            self.models,
+            self.args.pricing_url,
+            now,
+            self.args.pricing_refresh,
+            force_refresh=fresh_start,
+        )
+        # Retained history remains visible during a feed gap, but is not a
+        # fresh score and must not drive selection.
+        all_scores = revenue_scores(
+            {model: average for model, average in averages.items() if model in samples},
+            self.weights, prices,
+        )
+        eligible_models = [model for model in local_eligible if model in all_scores]
+        if fresh_start and manager_state["pricing_status"]["status"] != "live":
+            eligible_models = []
+        manager_state["pressure_history"] = history
+        manager_state["last_score_snapshot"] = build_score_snapshot(
+            self.models,
+            samples,
+            averages,
+            history,
+            prices,
+            self.weights,
+            all_scores,
+            now,
+            self.args.check_every * self.args.average_samples,
+            self.ignored,
+            eligible_models,
+            local if discovery_available else None,
+            self.args.model,
+        )
+
+        return ScoreCheck(samples, averages, prices, all_scores, local_eligible,
+                          eligible_models, discovery_available)
+
     def iteration(self) -> None:
         now = time.time()
         existing = (json.loads(self.state_path.read_text()) if self.state_path.exists() else {})
         if not isinstance(existing, dict):
             raise ValueError("invalid manager state")
-        if routing_recovery(existing).get("phase") in RECOVERY_ACTIVE_PHASES:
+        if recovery_blocks_selection(existing, self.args.recover_routing, self.args.apply):
             print_report(
                 [], {}, {}, {}, {}, {}, {}, existing,
                 read_daemon_state(self.args.daemon_state), None,
@@ -2184,76 +2318,14 @@ class Manager:
                 "discarded a legacy pending switch so startup preload can be "
                 "synchronized and retried"
             )
-        catalog = self.discover_catalog(manager_state, now)
-        local = self.discover_models(manager_state, now)
-        discovery_available = manager_state["discovery"]["status"] == "live"
-        try:
-            samples = fetch_capacity(self.args.base_url)
-        except Exception as error:
-            samples = {}
-            log(f"network capacity unavailable: {error}")
-
-        # The catalog and capacity feed expand the saved inventory only. They cannot
-        # authorize loading a model absent from a successful local scan.
-        visible = catalog | set(samples) | set(manager_state["discovery"].get("models") or []) | self.ignored
-        self.models = list(dict.fromkeys([
-            *(self.args.model or []), *ordered_model_ids(visible - self.ignored),
-            *self.args.ignore_model,
-        ]))
-        local_eligible = eligible_local_targets(
-            self.args.model if self.args.model is not None else self.models,
-            local, self.ignored,
-        )
-        reconcile_selection_policy(
-            manager_state, local_eligible, self.ignored,
-            discovery_available,
-        )
-        history, averages = update_pressure_history(
-            self.models,
-            samples,
-            manager_state.get("pressure_history") or {},
-            self.args.average_samples,
-            now,
-            self.args.check_every * self.args.average_samples,
-        )
-        prices = cached_model_prices(
-            manager_state,
-            self.models,
-            self.args.pricing_url,
-            now,
-            self.args.pricing_refresh,
-        )
-        # Catalog and price requests can be slow. Check freshness against the
-        # time after those reads, rather than the start of the iteration.
+        check = self.refresh_scores(manager_state, now)
+        samples, averages, prices, all_scores = check.samples, check.averages, check.prices, check.scores
+        local_eligible, eligible_models = check.local_eligible, check.eligible
+        discovery_available = check.discovery_available
+        history = manager_state["pressure_history"]
+        scores = {model: all_scores[model] for model in eligible_models}
+        # Score reads can be slow. Assess the daemon after they finish.
         daemon = read_daemon_state(self.args.daemon_state, now=time.time())
-        # Retained history remains visible during a feed gap, but is not a
-        # fresh score and must not drive selection.
-        all_scores = revenue_scores(
-            {model: average for model, average in averages.items() if model in samples},
-            self.weights, prices,
-        )
-        eligible_models = [model for model in local_eligible if model in all_scores]
-        scores = {
-            model: score
-            for model, score in all_scores.items()
-            if model in eligible_models
-        }
-        manager_state["pressure_history"] = history
-        manager_state["last_score_snapshot"] = build_score_snapshot(
-            self.models,
-            samples,
-            averages,
-            history,
-            prices,
-            self.weights,
-            all_scores,
-            now,
-            self.args.check_every * self.args.average_samples,
-            self.ignored,
-            eligible_models,
-            local if discovery_available else None,
-            self.args.model,
-        )
 
         current = current_warm_model(daemon, local_eligible)
         challenger_model_key, challenger_streak_key = challenger_state_keys(
@@ -2499,7 +2571,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("mode", choices=("once", "run", "set-prod-token", "reset-recovery"), nargs="?", default="once")
     parser.add_argument("--apply", action="store_true", help="enable model changes, opted-in probes and routing recovery; default is dry-run")
     parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart, plus one self-route prompt 3 minutes after switch warm-up; enables the local endpoint on model switches; requires --apply")
-    parser.add_argument("--recover-routing", action="store_true", help="optional routing recovery: after 15m warm and 3 local successes/self-route model_not_loaded failures 5m apart, stop for 15m and start the same model once; requires run --apply, local endpoint and production token; reset-recovery clears an inactive attempt")
+    parser.add_argument("--recover-routing", action="store_true", help="optional routing recovery: after 15m warm and 3 local successes/self-route model_not_loaded failures 5m apart, stop for 15m, then use fresh scores to start the highest eligible model once; requires run --apply, local endpoint and production token; reset-recovery clears an inactive attempt")
     parser.add_argument("--prod-token-file", type=Path, default=DEFAULT_PROD_TOKEN_PATH, help="private production token file; save with set-prod-token (default ~/.darkbloom/warm-model-manager-prod-token)")
     parser.add_argument("--local-endpoint-file", type=Path, default=DEFAULT_LOCAL_ENDPOINT_PATH, help="Darkbloom local endpoint metadata (default ~/.darkbloom/local.json; respects DARKBLOOM_LOCAL_DIR)")
     parser.add_argument("--columns", choices=("ladder", "full"), default="ladder", help="score display: ladder (default) or full table with current pressure, sample count and separate prices")

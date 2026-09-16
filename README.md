@@ -8,7 +8,7 @@ Example with illustrative values, with hourly probes and routing recovery enable
 
 ```text
 ================================================================================================================
-Darkbloom warm model manager 0.1.10    2026-09-16 07:31:52 PDT
+Darkbloom warm model manager 0.1.11    2026-09-16 07:31:52 PDT
 
 now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
          gemma-4-26b-qat-4bit: +261.17% improvement after switch cost; 2/3 consecutive checks passed
@@ -262,18 +262,42 @@ The sequence is fixed:
 4. Once all three checks pass, confirm the provider is idle and its process
    matches Darkbloom's launchd service. Issue `darkbloom stop` once. Wait until
    both the process and service are gone, then count **15 full minutes offline**.
-5. Start the same model using the same config and saved local endpoint settings.
-   Recheck its local availability and ignore rules first. A changed config,
-   removed/excluded model, or external provider start cancels the saved restart.
-6. Confirm warm-up, restart the minimum warm-time clock, and run a local/self-route
-   check three minutes later. Repeat those checks five minutes apart for up to
-   15 minutes after warm-up. If this provider receives network requests, recovery
-   is confirmed. Otherwise leave it running and report recovery as unconfirmed.
+5. Run a fresh first score check. Refresh the local model list, network pressure
+   and input/output prices. Discard pre-shutdown pressure averages and passing-check
+   counts, then start the **highest-scoring eligible model** using the same config
+   and local endpoint settings. The winner may differ from the stopped model.
+   Ignored, unavailable and `--model`-excluded models cannot win.
+6. Confirm warm-up, start a new minimum warm-time clock, and resume normal score
+   checks. Later switches use the usual improvement, consecutive-check and
+   minimum warm-time requirements.
+7. Check local inference and production self-routing three minutes after warm-up.
+   Repeat those checks five minutes apart for up to 15 minutes. Score checks
+   continue during this verification. If this provider receives network requests,
+   recovery is confirmed. Otherwise leave it running and report recovery as
+   unconfirmed.
 
-Recovery has its own checks; it does not move the hourly probe schedule. During
-the shutdown, start and verification stages, model switching and other probes
-remain paused. Overdue hourly probes resume through their usual one-at-a-time
-schedule afterward. Outside recovery, score-based switching keeps its normal rules.
+The first recovery selection uses one fresh pressure sample with the usual
+85% input / 15% output price blend and model weights. Nothing is warm at that
+point, so there is no current model to protect with a score margin, switch cost,
+passing-check wait or minimum warm time. Subsequent averages build normally.
+
+If the local scan, network pressure or fresh prices are unavailable, or no model
+is eligible, the provider stays offline. The manager retries the score check at
+`--check-every`, without another stop command or another 15-minute wait. It does
+not fall back to the old model or stale prices. A catalog outage alone does not
+block a model whose local availability, pressure and prices were verified.
+
+An ignored or removed old model does not prevent another eligible model from
+winning. The selected model is checked again before launch. A changed config
+or an external provider start cancels the saved restart. An interrupted or failed
+launch is never repeated automatically; the selected target stays saved while
+the manager checks whether it became warm.
+
+Recovery has its own probes and leaves the hourly schedule intact. Regular and
+post-switch probes stay paused through routing verification, then resume through
+their usual one-at-a-time schedule. Score-based switching resumes as soon as
+warm-up is confirmed. If a normal switch occurs during verification, that
+verification ends without clearing the guard against repeated recovery shutdowns.
 
 Self-route may reach another provider on your account. A successful HTTP response
 alone does not confirm recovery on this Mac. The manager logs the returned provider
@@ -289,14 +313,14 @@ an HTTP success from another Mac does not reset that guard. Failed or interrupte
 stop/start commands are not retried. The manager checks observed process and
 warm-up state because a timed-out command might still have succeeded.
 
-During recovery, the same layout shows the saved stage and restart time.
-Scoring is paused until recovery finishes:
+During the offline wait, the timeline shows when the fresh selection will run.
+No restart model is promised before that check:
 
 ```text
 now      STOPPED    LIVE, RECOVERY OFFLINE
 
 next     10:34:00  refresh recovery status; score checks paused
-         10:45:00  restart nvidia-nemotron-3.5-lightning; 12m remaining after confirmed stop
+         10:45:00  check fresh scores, then start the highest eligible model; 12m remaining after confirmed stop
          model switching and regular/after-switch probes paused during routing recovery
 
 score    paused during routing recovery; no fresh ranking
@@ -610,9 +634,15 @@ write permissions.
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 | Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's model, outcome, duration, HTTP status, redacted error or skip reason, finish reason, token counts and serving provider ID when available. |
 | Extra probe after a switch | Keep the target, provider process identity, warm-up confirmation and due time until the one-shot request is attempted or skipped. Retain its latest result separately from the hourly probe result. |
-| Optional routing recovery | Stage, model/process identity, one network counter baseline, reconnect count, failure count, next check, stop/start intent, offline deadline, elapsed-time reference, config digest and paths, local endpoint launch flags, latest redacted check results and the one-attempt guard. No config contents or tokens. |
+| Optional routing recovery | Stage, model/process identity, one network counter baseline, reconnect count, failure count, next check, fresh-selection retry time, previous/chosen model, stop/start intent, offline deadline, elapsed-time reference, config digest and paths, local endpoint launch flags, latest redacted check results and the one-attempt guard. No config contents or tokens. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
+
+A recovery start clears the old pressure samples, passing-check counts and warm
+residency before choosing from fresh data. It preserves the hourly probe schedule
+and recovery attempt guard. The new warm-time clock starts only after confirmed
+warm-up.
+
 The state file contains no prompts, generated replies or API keys. Probe errors
 retain only the short, redacted description from the result line. The production
 token lives in its separate private file; the local token stays in Darkbloom's
@@ -708,6 +738,11 @@ Existing commands now show the timeline and score ladder. Add `--columns full`
 to restore the detailed score table. `--hide-ignored` remains optional; it hides
 excluded rows without changing their saved calculations or eligibility.
 This display update preserves saved state and switching rules.
+
+After this update, an existing recovery still in its offline wait will use fresh
+scores when the wait ends. A launch already recorded as starting keeps its saved
+target; upgrading does not issue a replacement launch. During saved verification,
+normal score checks resume when running with `--apply --recover-routing`.
 
 The percentage-based switch rule replaces the old fixed `0.01` score requirement.
 Remove `--absolute-margin` if you used it. The default remains 25% improvement;
