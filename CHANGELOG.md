@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.10 — 2026-09-16
+
+- Put `now`, `next`, `score` and `sources` in a left gutter. Show score checks,
+  conditional switch times, recovery timers and probes in one ordered timeline.
+- Show both hourly endpoints alongside a pending post-switch self-route request.
+  Refresh the timeline after each probe attempt; keep HTTP results and errors.
+- Replace the default price table with a score ladder: raw score, relative bar,
+  cost-adjusted percentage versus the warm model, average pressure, blended
+  price and weight. Keep ignored rows and missing-data labels visible by default.
+- Add `--columns full` for the detailed table. Keep switching, recovery, saved
+  samples and timers unchanged. Use plain output for redirected logs and honor
+  `NO_COLOR` in terminals.
+- Update README examples and add offline coverage for timer ordering, paused
+  recovery, conditional switch times, score comparisons and both displays.
+
 ## 0.1.9 — 2026-09-16
 
 - Add optional `--recover-routing` for continuous live runs. Observe a model

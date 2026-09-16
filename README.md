@@ -4,36 +4,41 @@ Keeps one downloaded model warm on a running Darkbloom provider. The manager
 compares public network pressure and input/output prices, waits for a sustained score
 advantage, then switches when the provider is idle.
 
-Shortened example with illustrative values:
+Example with illustrative values, with hourly probes and routing recovery enabled:
 
 ```text
-Mode:      DRY RUN — no changes enabled
-Darkbloom: RUNNING (pid 4242) | warm: qwen3.5-35b-a3b | idle
-Discovery: live (local scan; refreshed every check)
-Catalog:   live; 7 models; fetched 10:00 AM PDT
-Prices:    cached; fetched 9:55 AM PDT
-Probes:    OFF (enable with --hourly-probes)
-Recovery:  OFF (enable with --recover-routing)
-Current:   qwen3.5-35b-a3b warm for 1 hour (since 9:00 AM PDT)
+================================================================================================================
+Darkbloom warm model manager 0.1.10    2026-09-16 07:31:52 PDT
 
-MODEL ID                            NOW  AVG 15m   N   IN$/M  OUT$/M BLEND$/M WEIGHT   SCORE STATUS
----------------------------------------------------------------------------------------------------
-* qwen3.5-35b-a3b                 0.683    0.356  15  0.0800  0.7500   0.1805   1.25   0.080
-  qwen3.6-35b-a3b-vl-mtp-mxfp8    0.121    0.099  15  0.0500  0.7000   0.1475   1.20   0.018
-  gemma-4-26b-qat-4bit            0.843    0.591  15  0.0420  0.2200   0.0687   1.05   0.043
-  gpt-oss-20b                     1.004    1.241  15  0.0200  0.1000   0.0320   1.00   0.040
-  Qwen3.5-9B                      0.258    0.359  15  0.0800  0.1300   0.0875   1.00   0.031
-  gemma-4-26b-8bit                0.000    0.000  15  0.0420  0.2200   0.0687   1.00   0.000 AUTO-IGNORED; not downloaded or filtered out
-  EigenLabs/Qwen3.8-27B-4bit-mtp  2.049    2.080  15  0.1500  2.0000   0.4275   1.00   0.889 IGNORED; not downloaded or filtered out
+now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
+         gemma-4-26b-qat-4bit: +261.17% improvement after switch cost; 2/3 consecutive checks passed
 
-Highest raw score: EigenLabs/Qwen3.8-27B-4bit-mtp [IGNORED] (0.889).
-Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.
-Ignored and auto-ignored models cannot be loaded.
+next     07:32:52  check 3 of 3 for gemma-4-26b-qat-4bit; earliest switch if checks still pass and the provider is online and idle
+         07:36:00  recovery check, local then production self-route
+         08:00:00  probe, local endpoint
+         08:30:00  probe, production self-route
+         +3m after a switch is confirmed warm: one production self-route request
 
-Decision:  KEEP → qwen3.5-35b-a3b
-Switch rule: at least 25% score improvement after switch cost (--switch-improvement-percent).
-Reason:    no allowed model scores higher after switch cost (current 0.0803225)
+score    MODEL ID                          SCORE                  VS WARM        AVG   BLEND$/M  WEIGHT
+           gemma-4-26b-qat-4bit            0.032  ████████████      +261%  avg 0.445   $0.0687  ×1.05
+           qwen3.5-35b-a3b                 0.023  ████████          +154%  avg 0.100   $0.1805  ×1.25
+           qwen3.6-35b-a3b-vl-mtp-mxfp8    0.015  ██████             +71%  avg 0.086   $0.1475  ×1.20
+           Qwen3.5-9B                      0.010  ████               +14%  avg 0.116   $0.0875  ×1.00
+         * nvidia-nemotron-3.5-lightning   0.008  ███                warm  avg 0.099   $0.0823  ×1.00
+
+         Highest raw score: gemma-4-26b-qat-4bit (0.032).
+         score = average pressure × blend price × weight; blend = 85% input price + 15% output price
+         % is after switch cost vs the warm model; raw ranking is not an approved switch
+         now, sample count, input and output prices: --columns full
+         switch requires at least 25% score improvement after switch cost, 3 consecutive passing checks and minimum warm time; ignored models cannot load
+
+sources  discovery live, local scan  catalog live, 5 models, fetched 07:31:52  prices cached, fetched 07:30:00
+         recovery monitoring, network requests reached this provider
 ```
+
+`now` shows what the provider is doing. `next` lists its timers in clock order.
+The score ladder puts the strongest raw scores first. Add `--columns full` for
+current pressure, sample counts, and separate input/output prices.
 
 [Install](#install) · [Run](#run) · [Routing recovery](#routing-recovery) · [Read the report](#read-the-report) · [FAQ](#faq)
 
@@ -159,20 +164,24 @@ to the paid fleet. It can choose another Mac that advertises the same model;
 it cannot pin a request to this computer. The local request reaches this Mac.
 See Darkbloom's [self-route documentation](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/self-route.md).
 
-Every report shows the next two probe times, with dates, seconds, timezone and
-countdowns. The same two lines appear after each attempt, including skipped
-or failed attempts. The display includes the extra request when it is one of
-the next two, labeled `production (after switch)`. For example, just after a
-model is confirmed warm at 10:10 AM:
+The `next` section shows both regular probe times and any pending post-switch
+request alongside score checks and recovery timers. It refreshes after each
+attempt, including failures and skips. Neither regular endpoint disappears when
+an extra request is pending. For a model confirmed warm at 10:10 AM:
 
 ```text
-Probe 1:   production (after switch) at 2026-09-16 10:13:00 PDT (in 3m)
-Probe 2:   production at 2026-09-16 10:30:00 PDT (in 20m)
+next     10:11:00  check scores
+         10:13:00  probe, production self-route after switch to Qwen3.5-9B
+         10:30:00  probe, production self-route
+         11:00:00  probe, local endpoint
 ```
 
-An overdue turn is labeled `overdue`. Its following turn is an estimate until
-the first attempt runs or is skipped. Dry runs show that no prompts are
-scheduled, even if a live schedule exists in the state file.
+Times use the timezone in the report header. Events on another day include the
+date. An overdue turn is labeled `overdue`; its following regular turn is an
+estimate until the first attempt runs or is skipped. Without a pending extra
+request, `+3m after a switch is confirmed warm` describes the rule, not a scheduled
+request. Dry runs show that no prompts are scheduled. `once` shows only a due
+attempt it can make before exiting, with no recurring timeline.
 
 Probe diagnostics are always printed when `--hourly-probes` is enabled. A
 `SENDING` line identifies the model, endpoint, route, token limit and timeout.
@@ -280,12 +289,17 @@ an HTTP success from another Mac does not reset that guard. Failed or interrupte
 stop/start commands are not retried. The manager checks observed process and
 warm-up state because a timed-out command might still have succeeded.
 
-The terminal shows the stage, errors and restart time:
+During recovery, the same layout shows the saved stage and restart time.
+Scoring is paused until recovery finishes:
 
 ```text
-Recovery:  OFFLINE; provider stopped; waiting 15 minutes before starting the same model
-Restart:   nvidia-nemotron-3.5-lightning at 2026-09-16 10:45:00 PDT; 12m remaining (after confirmed stop)
-Model switching and regular probes paused until recovery finishes.
+now      STOPPED    LIVE, RECOVERY OFFLINE
+
+next     10:34:00  refresh recovery status; score checks paused
+         10:45:00  restart nvidia-nemotron-3.5-lightning; 12m remaining after confirmed stop
+         model switching and regular/after-switch probes paused during routing recovery
+
+score    paused during routing recovery; no fresh ranking
 ```
 
 Keep the manager running through the wait. **Ctrl-C during recovery can leave
@@ -316,35 +330,63 @@ the manager's recovery procedure has not been tested against a live provider.
 
 ## Read the report
 
-In the example, Qwen 3.8 has the highest raw score at `0.889`, but it is ignored.
-The manager keeps `qwen3.5-35b-a3b`: its `0.080` score leads the models allowed
-to load. A high score alone does not approve a switch.
+The four gutter labels stay in the same order:
 
-The `*` marks a currently warm model. Warm means the model is loaded in memory;
-`idle` means the provider is not currently serving a request. `Current` shows
-how long that model has been warm.
+- `now`: warm model, time warm, request activity and the current decision.
+- `next`: score checks, conditional switch time, recovery checks and probes, sorted
+  by clock time. During a recovery shutdown it includes the saved restart deadline.
+- `score`: models sorted by raw score, with the warm model marked `*`.
+- `sources`: local discovery, catalog and price freshness, plus recovery status.
 
-| Table column | Meaning |
+In the example, Gemma leads by about 261% **after switch cost**, with two of
+three checks passed. The third check is next. Gemma must still pass and the
+provider must be idle before the manager can switch.
+
+The ladder shows each exact model ID, its score, a bar relative to the highest
+visible score, and its percentage above or below the warm model. Then come the
+three score inputs: average pressure, blended price and weight. The raw score
+and bar do not include switch cost; the percentage does. A percentage advantage
+alone does not approve a switch.
+
+`N/A` means a value is unavailable, not zero. Without one fresh warm model and
+its score, there is no percentage comparison. When the warm score is zero,
+`> zero` or `equal zero` replaces a percentage. Unknown scores sort last. Tied
+scores keep their existing model order.
+
+Warm means loaded in memory. Idle means the provider is not serving a request.
+Pressure describes the network, not the number of requests reaching your Mac.
+Prices show four decimals and scores show three; calculations use the full values.
+
+For the detailed table, append `--columns full` to your command:
+
+```sh
+python3 warm_model_manager.py run --columns full
+```
+
+This example is a dry run. `--columns full` changes only the score section;
+the timeline stays above it. `--columns ladder` selects the default again.
+Neither choice resets samples, confirmations, saved timers or switching rules.
+
+| Full table column | Meaning |
 | --- | --- |
 | `MODEL ID` | Exact ID accepted by `--ignore-model`, including capitalization and namespace. |
 | `NOW` | Current public network pressure: active requests divided by warm providers, with a minimum denominator of 1. |
 | `AVG 15m` | Average of retained pressure samples. The time label follows your check interval and sample limit. |
-| `N` | Number of samples in that average. It can be below the limit after startup or during a data gap. |
+| `N` | Samples in that average. It can be below the limit after startup or during a data gap. |
 | `IN$/M` | Input price per million input tokens. |
 | `OUT$/M` | Output price per million output tokens. |
 | `BLEND$/M` | Price per million total tokens at the fixed 85% input / 15% output mix, before pressure and weight. |
 | `WEIGHT` | Model score multiplier, set with `--weight`. |
 | `SCORE` | Average pressure × blended price × weight. |
-| `STATUS` | Exclusion or missing-data reason. `IGNORED` is an explicit exclusion; `AUTO-IGNORED` follows local availability or `--model`. |
+| `STATUS` | Exclusion or missing-data reason. `IGNORED` is explicit; `AUTO-IGNORED` follows local availability or `--model`. |
 
-Pressure describes the network, not the number of requests arriving at your
-Mac. Price columns show four decimal places; calculations use the full values.
-`N/A` means a value is unavailable, not zero.
+Ignored and auto-ignored rows remain visible by default, including their math.
+`Highest raw score` identifies the leader and any ties, with exclusions marked.
+With `--hide-ignored`, it ranks only visible rows. Hidden models still have their
+calculations saved, and excluded models can never be selected or loaded.
 
-By default, `Highest raw score` includes ignored and auto-ignored models and
-shows ties. With `--hide-ignored`, it ranks only shown rows. In either view,
-the ranking comes before switch cost, required improvement, consecutive passing
-checks, and minimum warm time.
+Terminal color distinguishes the warm model and the leading eligible score.
+Redirected output stays plain text. Set `NO_COLOR=1` to disable color in a terminal.
 
 | Decision | Meaning |
 | --- | --- |
@@ -355,15 +397,16 @@ checks, and minimum warm time.
 | `DEFERRED` | A model was selected, but a condition such as active work or minimum warm time blocks the launch. |
 | `WAIT` | There is no eligible scored target, or the current model's score is unavailable. |
 
-`Reason` explains the decision. `Candidate` shows progress such as
-`2/3 consecutive checks passed`, alongside `--switch-after-checks`.
-`Earliest switch` is conditional: the candidate must keep passing, the provider
-must be online and idle, and minimum warm time must have elapsed. A wait for
-warm time names `--min-warm-time`; `Deferred` gives the current blocker.
+The line under `now` explains the decision or shows the passing-check count.
+An earliest switch in `next` is conditional: the candidate must keep passing,
+the provider must be online and idle, and minimum warm time must have elapsed.
+The estimate rounds up to the next score check after those requirements can
+clear. A candidate below the required percentage has no switch countdown.
+Pending warm-up has no invented completion time.
 
-`Discovery` reports the local scan. `Catalog` reports the supported-model list.
-`Prices` shows whether prices were fetched, cached, or retained after a failed
-refresh, with their fetch time.
+`next` reads the existing timers; it does not create extra checks or requests.
+A slow network call or provider command can delay events. Source timestamps
+show when catalog and price data were fetched; a stale cache stays labeled stale.
 
 ## How scores work
 
@@ -618,11 +661,11 @@ never permits a launch.
 If local discovery fails, the last inventory remains visible and new launches
 are blocked. Local availability is unknown, and the rows say `local scan unavailable`.
 With `--hide-ignored`, those rows are hidden until a successful scan confirms
-local availability. The `Discovery: unavailable` message remains visible.
+local availability. The `sources` line still says `discovery unavailable`.
 
 ### Why hasn't it switched?
 
-Read `Reason`, `Candidate`, and `Deferred` in the report. The candidate may need
+Read the explanation under `now` and the `next` timeline. The candidate may need
 more passing checks (`--switch-after-checks`), the current model may need more
 warm time (`--min-warm-time`), or the improvement after switch cost may be below
 `--switch-improvement-percent`. A busy, stopped, or stale provider also blocks
@@ -661,8 +704,10 @@ Replacing the script leaves saved state intact.
 [Release notes and checksums](https://github.com/benbuschmann/darkbloom-manager/releases/latest)
 are available on GitHub. Script and state filenames stay the same across releases.
 
-`--hide-ignored` is optional. Existing commands keep the full table. To hide
-excluded models, add the flag; your saved state and switching rules stay intact.
+Existing commands now show the timeline and score ladder. Add `--columns full`
+to restore the detailed score table. `--hide-ignored` remains optional; it hides
+excluded rows without changing their saved calculations or eligibility.
+This display update preserves saved state and switching rules.
 
 The percentage-based switch rule replaces the old fixed `0.01` score requirement.
 Remove `--absolute-margin` if you used it. The default remains 25% improvement;

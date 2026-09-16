@@ -7,7 +7,7 @@ same assumed token mix without measuring provider throughput or actual payouts.
 
 Every selection requests exactly one warm model. The catalog, network capacity,
 and local scan supply the model inventory. Ignored and auto-ignored models stay
-visible by default. Use --hide-ignored to hide them from the table and its ranking;
+visible by default. Use --hide-ignored to hide them from the display and its ranking;
 their calculations remain in saved state.
 
 The file is intentionally standalone: copy only this script to a Mac running
@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.9"
+MANAGER_VERSION = "0.1.10"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -889,29 +889,6 @@ def routing_recovery(state: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def recovery_lines(state: dict[str, Any], now: float, enabled: bool, apply: bool) -> list[str]:
-    recovery = routing_recovery(state)
-    active = recovery.get("phase") in RECOVERY_ACTIVE_PHASES
-    if not enabled and not active:
-        return ["Recovery:  OFF (enable with --recover-routing)"]
-    if not apply or not enabled:
-        suffix = "; saved recovery is paused" if active else ""
-        return ["Recovery:  no recovery actions; run --apply --recover-routing required" + suffix]
-    if not recovery:
-        return ["Recovery:  waiting for one warm model"]
-    lines = [f"Recovery:  {recovery['phase'].upper()}; {recovery.get('reason', 'monitoring routing')}"]
-    if recovery.get("phase") == "offline":
-        at = recovery["restart_at"]
-        stamp = datetime.fromtimestamp(at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        lines.append(f"Restart:   {recovery['model']} at {stamp}; "
-                     f"{format_duration(max(0, at - now))} remaining (after confirmed stop)")
-    elif recovery.get("phase") in {"monitoring", "checking", "verifying"} and recovery.get("next_check_at"):
-        at = recovery["next_check_at"]
-        stamp = datetime.fromtimestamp(at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        lines.append(f"Recovery check: local, then production self-route at {stamp}")
-    return lines
-
-
 def warm_selection_matches(
     daemon: LocalDaemonState | None,
     target: str | None,
@@ -1365,33 +1342,6 @@ def next_probe_event(manager_state: dict[str, Any], now: float) -> tuple[str, fl
     return kind, at, False
 
 
-def probe_schedule_lines(manager_state: dict[str, Any], now: float,
-                         enabled: bool, apply: bool) -> list[str]:
-    if routing_recovery(manager_state).get("phase") in RECOVERY_ACTIVE_PHASES:
-        return ["Probes:    regular and after-switch probes paused during routing recovery"]
-    if not enabled:
-        return ["Probes:    OFF (enable with --hourly-probes)"]
-    if not apply:
-        return ["Probes:    DRY RUN; no prompts scheduled (--apply required)"]
-    kind, at = next_probe_slot(manager_state, now)
-    other = "production" if kind == "local" else "local"
-    candidates = [(kind, at, False), (other, max(now, at) + PROBE_SPACING, at <= now)]
-    event = pending_switch_probe(manager_state)
-    if event:
-        candidates.insert(0, ("production (after switch)", event["due_at"], False))
-    lines = []
-    for number, (endpoint, when, estimated) in enumerate(sorted(candidates, key=lambda item: item[1])[:2], 1):
-        stamp = datetime.fromtimestamp(when).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        wait = when - now
-        timing = f"in {format_duration(wait)}" if wait > 0 else "due now; next attempt"
-        if wait < 0:
-            timing = f"overdue by {format_duration(-wait)}; next attempt"
-        if estimated:
-            timing += f"; estimated, 30m after {kind} attempt"
-        lines.append(f"Probe {number}:   {endpoint} at {stamp} ({timing})")
-    return lines
-
-
 def track_current_residency(
     manager_state: dict[str, Any],
     daemon: LocalDaemonState | None,
@@ -1470,214 +1420,174 @@ def switch_block_reason(
     return None
 
 
-def switch_forecast(
-    current: str | None,
-    decision: Decision,
-    manager_state: dict[str, Any],
-    daemon: LocalDaemonState | None,
-    now: float,
-    interval_seconds: float,
-    confirmations: int,
-    min_dwell_seconds: float,
-) -> str | None:
-    """Describe the earliest conditional switch time at the current cadence."""
-    if decision.target is None:
+@dataclass(frozen=True)
+class TimelineEvent:
+    at: float
+    text: str
+    attention: bool = False
+
+
+def switch_ready_at(current: str | None, decision: Decision, state: dict[str, Any],
+                    daemon: LocalDaemonState | None, now: float, next_check: float,
+                    interval: float, confirmations: int, minimum: float) -> float | None:
+    """Earliest conditional action on the score-check cadence, without changing it."""
+    if not decision.target or decision.warming:
         return None
-    if decision.warming:
-        # A pending command may have failed or timed out. Its reason explains
-        # the state; it does not provide a reliable loading ETA.
+    if decision.target == current and (not decision.challenger or decision.challenger_streak <= 0):
         return None
+    remaining = max(0, confirmations - decision.challenger_streak) if decision.target == current else 0
+    passing_at = next_check + (remaining - 1) * interval if remaining else now
+    anchor = dwell_anchor(state, daemon)
+    ready = max(passing_at, anchor + minimum if anchor else now)
+    if ready <= now:
+        return now
+    return next_check + max(0, math.ceil((ready - next_check) / interval)) * interval
 
-    if current is None:
-        if decision.target:
-            return (
-                f"{display_name(decision.target)} can switch at the next safe action "
-                "once Darkbloom is online and idle and any minimum warm time has elapsed (--min-warm-time)"
-            )
-        return None
 
-    if decision.target == current and decision.challenger is None:
-        return None
+def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
+                    current: str | None, decision: Decision, now: float,
+                    next_check: float | None, interval: float, confirmations: int,
+                    minimum: float, hourly_probes: bool, recover_routing: bool,
+                    apply: bool) -> tuple[list[TimelineEvent], list[str]]:
+    """Read all timers together. Conditional/paused actions have no invented date."""
+    events: list[TimelineEvent] = []
+    notes: list[str] = []
+    recovery = routing_recovery(state)
+    phase = recovery.get("phase")
+    recovering = phase in RECOVERY_ACTIVE_PHASES
+    continuous = next_check is not None
+    if continuous:
+        check_at = max(now, next_check)
+        text = "refresh recovery status; score checks paused" if recovering else "check scores"
+        ready_at = None if recovering or state.get("pending_switch") else switch_ready_at(
+            current, decision, state, daemon, now, check_at, interval, confirmations, minimum)
+        contender = decision.challenger or decision.target
+        if not recovering and (decision.warming or state.get("pending_switch")):
+            text = "check pending model warm-up"
+        elif not recovering and decision.challenger and decision.target == current and decision.challenger_streak > 0:
+            count = min(confirmations, decision.challenger_streak + 1)
+            text = f"check {count} of {confirmations} for {contender}"
+        switch_verb = "would switch" if not apply else "switch"
+        condition = "if checks still pass and the provider is online and idle"
+        if ready_at is not None and ready_at == check_at:
+            text += f"; earliest {switch_verb} {condition}"
+        elif ready_at is not None:
+            events.append(TimelineEvent(ready_at, f"earliest {switch_verb} to {contender}, {condition}", True))
+        events.append(TimelineEvent(check_at, text, bool(decision.challenger) and not recovering))
+    else:
+        notes.append("one check only; no recurring events scheduled")
 
-    contender = decision.challenger or decision.target
-    if decision.target == current and decision.challenger_streak <= 0:
-        return (
-            f"no estimate yet; {display_name(contender)} "
-            "does not meet the required percentage improvement after switch cost"
-        )
+    if recovering:
+        notes.append("model switching and regular/after-switch probes paused during routing recovery")
+    if recover_routing and apply and continuous:
+        if phase == "offline":
+            at = recovery["restart_at"]
+            events.append(TimelineEvent(at, f"restart {recovery['model']}; {format_duration(max(0, at - now))} remaining after confirmed stop", True))
+        elif phase in {"monitoring", "checking", "verifying"} and recovery.get("next_check_at") is not None:
+            deadline = recovery.get("verify_by") if phase == "verifying" else None
+            if deadline is None or max(now, recovery["next_check_at"]) < deadline:
+                events.append(TimelineEvent(recovery["next_check_at"], "recovery check, local then production self-route"))
+            if phase == "verifying" and recovery.get("verify_by") is not None:
+                events.append(TimelineEvent(recovery["verify_by"], "recovery verification deadline; no second restart"))
+        elif phase in {"starting", "stopping"}:
+            notes.append("waiting for confirmed " + ("warm-up" if phase == "starting" else "shutdown; 15m offline wait starts then"))
+        elif not recovery:
+            notes.append("recovery observation starts once one model is confirmed warm")
+    elif recovering:
+        notes.append("saved recovery is paused; resume with run --apply --recover-routing")
 
-    remaining_checks = 0
-    if decision.target == current:
-        remaining_checks = max(0, confirmations - decision.challenger_streak)
-    confirmation_wait = remaining_checks * interval_seconds
+    if hourly_probes and apply and not recovering:
+        kind, at = next_probe_slot(state, now)
+        other = "production" if kind == "local" else "local"
+        candidates = [(kind, at, False), (other, max(now, at) + PROBE_SPACING, at <= now)]
+        extra = pending_switch_probe(state)
+        if extra:
+            candidates.insert(0, ("after switch", extra["due_at"], False))
+        if not continuous:
+            # `once` can attempt just one due probe before exiting.
+            candidates = sorted(candidates, key=lambda item: item[1])[:1]
+            candidates = [item for item in candidates if item[1] <= now]
+        for kind, at, estimated in candidates:
+            endpoint = "local endpoint" if kind == "local" else "production self-route"
+            text = f"probe, {endpoint}"
+            if kind == "after switch":
+                text += f" after switch to {extra['target']}"
+            if estimated:
+                text += "; estimated, 30m after the preceding regular attempt"
+            events.append(TimelineEvent(at, text))
+        if continuous and not extra:
+            notes.append("+3m after a switch is confirmed warm: one production self-route request")
+    elif hourly_probes and not apply:
+        notes.append("probes disabled in DRY RUN; --apply required")
+    return sorted(events, key=lambda event: event.at), notes
 
-    anchor = dwell_anchor(manager_state, daemon)
-    dwell_wait = (
-        max(0.0, min_dwell_seconds - (now - anchor)) if anchor > 0 else 0.0
-    )
-    wait = max(confirmation_wait, dwell_wait)
-    if wait > 0 and interval_seconds > 0:
-        # Decisions only happen on ticks, so round to the first actual check at
-        # or after all confirmation and dwell requirements have cleared.
-        wait = math.ceil(wait / interval_seconds) * interval_seconds
 
-    condition = (
-        f"if {display_name(contender)} keeps meeting the percentage requirement and the provider is idle"
-    )
-    if wait <= 0:
-        if daemon and daemon.inference_active:
-            return f"as soon as the provider becomes idle, {condition}"
-        return f"now, {condition}"
-    switch_at = now + wait
-    return (
-        f"about {format_human_duration(wait)} "
-        f"(around {format_local_time(switch_at, now)}), {condition}"
-    )
+def terminal_style(text: str, style: str) -> str:
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb":
+        return text
+    code = {"muted": "90", "warm": "1", "lead": "33"}[style]
+    return f"\033[{code}m{text}\033[0m"
+
+
+def section_line(section: str, text: str, style: str | None = None) -> None:
+    body = terminal_style(text, style) if style else text
+    print(terminal_style(f"{section:<9}", "muted") + body, flush=True)
+
+
+def timeline_clock(at: float, now: float) -> str:
+    moment = datetime.fromtimestamp(at).astimezone()
+    today = datetime.fromtimestamp(now).astimezone()
+    return moment.strftime("%H:%M:%S" if moment.date() == today.date() else "%b %d %H:%M:%S")
+
+
+def print_timeline(events: list[TimelineEvent], notes: list[str], now: float) -> None:
+    label = "next"
+    for event in events:
+        timing = timeline_clock(event.at, now)
+        if event.at <= now:
+            timing += " (due now)" if event.at == now else f" (overdue {format_duration(now - event.at)})"
+        section_line(label, f"{timing}  {event.text}", "lead" if event.attention else None)
+        label = ""
+    for note in notes:
+        section_line(label, note, "muted")
+        label = ""
+
+
+def score_distance(score: float | None, warm_score: float | None,
+                   switch_cost: float, horizon: float) -> str:
+    if score is None or warm_score is None:
+        return "N/A"
+    adjusted = score * max(0, (horizon - switch_cost) / horizon)
+    if warm_score == 0:
+        return "> zero" if adjusted > 0 else "equal zero"
+    return f"{(adjusted / warm_score - 1) * 100:+.0f}%"
 
 
 def print_report(
-    models: list[str],
-    samples: dict[str, CapacitySample],
-    averages: dict[str, float],
-    weights: dict[str, float],
-    prices: dict[str, ModelPrice],
-    scores: dict[str, float],
-    pressure_history: dict[str, list[dict[str, float]]],
-    manager_state: dict[str, Any],
-    daemon: LocalDaemonState | None,
-    current: str | None,
-    decision: Decision,
-    apply: bool,
-    interval_seconds: float,
-    history_size: int,
-    confirmations: int,
-    now: float,
-    residency: tuple[float, float] | None,
-    forecast: str | None,
-    ignored_models: set[str],
-    eligible_models: list[str],
-    blocked: str | None,
-    improvement_percent: float,
-    hide_ignored: bool,
-    hourly_probes: bool = False,
-    recover_routing: bool = False,
+    models: list[str], samples: dict[str, CapacitySample], averages: dict[str, float],
+    weights: dict[str, float], prices: dict[str, ModelPrice], scores: dict[str, float],
+    pressure_history: dict[str, list[dict[str, float]]], manager_state: dict[str, Any],
+    daemon: LocalDaemonState | None, current: str | None, decision: Decision,
+    apply: bool, interval_seconds: float, history_size: int, confirmations: int,
+    now: float, residency: tuple[float, float] | None,
+    ignored_models: set[str], eligible_models: list[str], blocked: str | None,
+    improvement_percent: float, hide_ignored: bool, hourly_probes: bool = False,
+    recover_routing: bool = False, columns: str = "ladder", switch_cost: float = 300,
+    horizon: float = 3600, minimum: float = 2700, next_check: float | None = None,
 ) -> None:
-    timestamp = datetime.fromtimestamp(now).astimezone().strftime(
-        "%Y-%m-%d %H:%M:%S %Z"
-    )
-    mode = "LIVE — changes enabled" if apply else "DRY RUN — no changes enabled"
     snapshot_models = (manager_state.get("last_score_snapshot") or {}).get("models", {})
-    hidden_ignored = {
-        model for model in models
-        if model in ignored_models or snapshot_models.get(model, {}).get("ignored")
-    }
-    hidden_auto = {
-        model for model in models
-        if model not in hidden_ignored and snapshot_models.get(model, {}).get("auto_ignored")
-    }
-    shown_models = (
-        [model for model in models if model not in hidden_ignored | hidden_auto]
-        if hide_ignored else models
-    )
-    model_width = max([25, *(len(display_name(model)) + 2 for model in shown_models)])
-    average_label = f"AVG {format_duration(interval_seconds * history_size)}"
-    table_header = (
-        f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} "
-        f"{'IN$/M':>7} {'OUT$/M':>7} {'BLEND$/M':>8} {'WEIGHT':>6} {'SCORE':>7} STATUS"
-    )
-
-    print("", flush=True)
-    print("=" * len(table_header), flush=True)
-    print(
-        f"Darkbloom Warm Model Manager ({MANAGER_VERSION})  |  {timestamp}",
-        flush=True,
-    )
-    print(f"Mode:      {mode}", flush=True)
-    print(f"Darkbloom: {daemon_status_line(daemon)}", flush=True)
-    discovery = manager_state.get("discovery") or {}
-    print(f"Discovery: {discovery.get('status', 'unknown')} (local scan; refreshed every check)", flush=True)
-    catalog = manager_state.get("catalog") or {}
-    catalog_at = catalog.get("fetched_at")
-    catalog_age = f"; fetched {format_local_time(catalog_at, now)}" if catalog_at else ""
-    catalog_count = len(catalog.get("models") or [])
-    catalog_detail = (
-        f"{catalog_count} model{'s' if catalog_count != 1 else ''}"
-        if catalog.get("status") in {"live", "stale cache"} else "no cached catalog"
-    )
-    print(f"Catalog:   {catalog.get('status', 'unavailable')}; {catalog_detail}{catalog_age}", flush=True)
-    pricing = manager_state.get("pricing_status") or {}
-    fetched_at = pricing.get("fetched_at")
-    price_age = f"; fetched {format_local_time(fetched_at, now)}" if fetched_at else ""
-    print(f"Prices:    {pricing.get('status', 'unknown')}{price_age}", flush=True)
-    for line in probe_schedule_lines(manager_state, now, hourly_probes, apply):
-        print(line, flush=True)
-    for line in recovery_lines(manager_state, now, recover_routing, apply):
-        print(line, flush=True)
-    if hide_ignored:
-        print(
-            f"Models:    {len(shown_models)} shown; {len(hidden_ignored)} ignored hidden; "
-            f"{len(hidden_auto)} auto-ignored hidden",
-            flush=True,
-        )
-    if current and residency:
-        elapsed, warm_since = residency
-        print(
-            f"Current:   {display_name(current)} warm for "
-            f"{format_human_duration(elapsed)} "
-            f"(since {format_local_time(warm_since, now)})",
-            flush=True,
-        )
-    print("", flush=True)
-    print(table_header, flush=True)
-    print("-" * len(table_header), flush=True)
-    def number(value: float | None, decimals: int = 3) -> str:
-        return f"{value:.{decimals}f}" if value is not None else "N/A"
-
-    if not shown_models:
-        print("No models to show.", flush=True)
-    for model in shown_models:
-        sample = samples.get(model)
-        marker = (
-            "*"
-            if daemon
-            and daemon.alive
-            and daemon.fresh
-            and model in daemon.warm_models
-            else " "
-        )
-        label = f"{marker} {display_name(model)}"
-        price = prices.get(model, ModelPrice(None, None))
-        sample_count = len(pressure_history.get(model, []))
-        status = snapshot_models.get(model, {}).get("status", [])
-        print(
-            f"{label:<{model_width}} {number(sample.pressure if sample else None):>6} "
-            f"{number(averages.get(model)):>8} {sample_count:>3} "
-            f"{number(price.input_usd, 4):>7} {number(price.output_usd, 4):>7} "
-            f"{number(price.blended_usd, 4):>8} "
-            f"{weights.get(model, 1.0):>6.2f} {number(scores.get(model)):>7} "
-            + "; ".join(status),
-            flush=True,
-        )
-    shown_scores = {model: scores[model] for model in shown_models if model in scores}
-    if shown_scores:
-        print("", flush=True)
-        highest = max(shown_scores.values())
-        leaders = [model for model in shown_models if shown_scores.get(model) == highest]
-        names = [display_name(model) + (
-            " [IGNORED]" if model in hidden_ignored else
-            " [AUTO-IGNORED]" if model in hidden_auto else ""
-        ) for model in leaders]
-        ranking_label = "Highest raw score (shown models)" if hide_ignored else "Highest raw score"
-        print(ranking_label + ": " + " = ".join(names) + f" ({highest:.3f}).", flush=True)
-        print("Ranking is before switch cost, required score improvement, consecutive passing checks and minimum warm time.", flush=True)
-        print("Ignored and auto-ignored models cannot be loaded.", flush=True)
-    print("", flush=True)
-    target_changed = current != decision.target
-    selection_ready = warm_selection_matches(
-        daemon,
-        decision.target,
-    )
-    if decision.target is None:
+    ignored = {model for model in models if model in ignored_models or snapshot_models.get(model, {}).get("ignored")}
+    auto = {model for model in models if model not in ignored and snapshot_models.get(model, {}).get("auto_ignored")}
+    shown = [model for model in models if not hide_ignored or model not in ignored | auto]
+    shown_scores = {model: scores[model] for model in shown if model in scores}
+    warm_models = daemon.warm_models if daemon and daemon.alive and daemon.fresh else ()
+    warm = warm_models[0] if len(warm_models) == 1 else None
+    recovery = routing_recovery(manager_state)
+    recovering = recovery.get("phase") in RECOVERY_ACTIVE_PHASES
+    selection_ready = warm_selection_matches(daemon, decision.target)
+    if recovering:
+        action = "RECOVERY " + recovery["phase"].upper()
+    elif not decision.target:
         action = "WAIT"
     elif decision.warming:
         action = "WARMING"
@@ -1685,40 +1595,124 @@ def print_report(
         action = "KEEP"
     elif blocked:
         action = "DEFERRED"
-    elif target_changed and apply:
-        action = "SWITCH"
-    elif target_changed:
-        action = "WOULD SWITCH"
     else:
-        action = "KEEP"
-    print(f"Decision:  {action} → {display_name(decision.target)}", flush=True)
-    print(f"Switch rule: at least {improvement_percent:g}% score improvement after switch cost (--switch-improvement-percent).", flush=True)
-    if decision.challenger and decision.target == current:
-        progress = (
-            f" — {decision.challenger_streak}/{confirmations} consecutive checks passed (--switch-after-checks)"
-            if decision.challenger_streak > 0
-            else " — needs a larger score advantage"
-        )
-        print(
-            f"Candidate: {display_name(decision.challenger)}{progress}",
-            flush=True,
-        )
-    if forecast:
-        print(f"Earliest switch: {forecast}", flush=True)
-    print(f"Reason:    {decision.reason}", flush=True)
-    if blocked and decision.target is not None and not selection_ready and not decision.warming:
-        print(f"Deferred:  {blocked}", flush=True)
-    print(
-        f"BLEND$/M = {INPUT_TOKEN_SHARE:.0%} input price + {OUTPUT_TOKEN_SHARE:.0%} output price per million total tokens.",
-        flush=True,
-    )
-    print("Score = average pressure × BLEND$/M × weight (ranking estimate).", flush=True)
-    print(
-        f"N is the number of retained samples (max {history_size}, --average-samples); samples expire "
-        f"after {format_duration(interval_seconds * history_size)}.",
-        flush=True,
-    )
-    print("* marks currently warm models; NOW is the current network snapshot.", flush=True)
+        action = "SWITCH" if apply else "WOULD SWITCH"
+    model_width = max([25, *(len(model) + 2 for model in shown)])
+    average_label = f"AVG {format_duration(interval_seconds * history_size)}"
+    table_header = (f"{'MODEL ID':<{model_width}} {'NOW':>6} {average_label:>8} {'N':>3} "
+                    f"{'IN$/M':>7} {'OUT$/M':>7} {'BLEND$/M':>8} {'WEIGHT':>6} {'SCORE':>7} STATUS")
+    timestamp = datetime.fromtimestamp(now).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print("\n" + "=" * (len(table_header) + 9 if columns == "full" else 112), flush=True)
+    print(f"Darkbloom warm model manager {MANAGER_VERSION}    {timestamp}\n", flush=True)
+    mode = "LIVE" if apply else "DRY RUN"
+    if warm_models:
+        elapsed = f"warm {format_human_duration(residency[0])}  " if residency else "warm  "
+        activity = "serving a request" if daemon.inference_active else "idle"
+        description = f"{', '.join(warm_models)}  {elapsed}{activity}"
+    else:
+        description = daemon_status_line(daemon)
+    section_line("now", f"{description}    {mode}, {action}", "warm")
+    if not recovering:
+        if (columns == "ladder" and decision.challenger_streak > 0
+                and decision.challenger in scores and current == warm and warm in scores
+                and not decision.warming):
+            adjusted = scores[decision.challenger] * max(0, (horizon - switch_cost) / horizon)
+            gain = (f"{(adjusted / scores[warm] - 1) * 100:+.2f}% improvement"
+                    if scores[warm] > 0 else "positive score above a zero warm score")
+            section_line("", f"{decision.challenger}: {gain} after switch cost; "
+                         f"{decision.challenger_streak}/{confirmations} consecutive checks passed")
+        else:
+            section_line("", decision.reason)
+        if blocked and decision.target and not selection_ready and not decision.warming:
+            section_line("", "waiting: " + blocked)
+        if decision.target and decision.target != warm:
+            section_line("", f"target: {decision.target}")
+    events, notes = report_timeline(manager_state, daemon, current, decision, now, next_check,
+                                   interval_seconds, confirmations, minimum, hourly_probes,
+                                   recover_routing, apply)
+    print("", flush=True)
+    print_timeline(events, notes, now)
+    print("", flush=True)
+
+    def number(value: float | None, decimals: int = 3) -> str:
+        return f"{value:.{decimals}f}" if value is not None else "N/A"
+
+    if recovering:
+        section_line("score", "paused during routing recovery; no fresh ranking")
+    elif not shown:
+        section_line("score", "No models to show.")
+    elif columns == "full":
+        section_line("score", table_header)
+        section_line("", "-" * len(table_header))
+        for model in shown:
+            sample = samples.get(model)
+            label = f"{'*' if model in warm_models else ' '} {model}"
+            price = prices.get(model, ModelPrice(None, None))
+            section_line("", f"{label:<{model_width}} {number(sample.pressure if sample else None):>6} "
+                         f"{number(averages.get(model)):>8} {len(pressure_history.get(model, [])):>3} "
+                         f"{number(price.input_usd, 4):>7} {number(price.output_usd, 4):>7} "
+                         f"{number(price.blended_usd, 4):>8} {weights.get(model, 1):>6.2f} "
+                         f"{number(scores.get(model)):>7} " + "; ".join(snapshot_models.get(model, {}).get("status", [])))
+    else:
+        top = max(shown_scores.values(), default=0)
+        eligible_top = max((scores[model] for model in shown if model in eligible_models and model in scores), default=None)
+        # Stable sorting keeps the configured tie order. Unknown scores go last.
+        ranked = sorted(shown, key=lambda model: (model not in scores, -scores.get(model, 0)))
+        bar_char = "█" if (sys.stdout.encoding or "").lower().replace("-", "") == "utf8" else "#"
+        section_line("score", f"{'MODEL ID':<{model_width}} {'SCORE':>7}  {'':12} {'VS WARM':>10}  {'AVG':>9} {'BLEND$/M':>10} {'WEIGHT':>7}", "muted")
+        for model in ranked:
+            score = scores.get(model)
+            bar_size = max(1, round(score / top * 12)) if score is not None and score > 0 and top > 0 else 0
+            bar = bar_char * bar_size
+            distance = "warm" if model == warm else score_distance(score, scores.get(warm), switch_cost, horizon)
+            price = prices.get(model, ModelPrice(None, None))
+            label = f"{'*' if model in warm_models else ' '} {model}"
+            status = "; ".join(snapshot_models.get(model, {}).get("status", []))
+            price_cell = f"${price.blended_usd:.4f}" if price.blended_usd is not None else "N/A"
+            line = (f"{label:<{model_width}} {number(score):>7}  {bar:<12} {distance:>10}  "
+                    f"avg {number(averages.get(model)):>5}  {price_cell:>8}  "
+                    f"×{weights.get(model, 1):.2f}" + (f"  {status}" if status else ""))
+            style = "warm" if model == warm else "lead" if score is not None and score == eligible_top and model in eligible_models else None
+            section_line("", line, style)
+    if not recovering:
+        print("", flush=True)
+        if shown_scores:
+            highest = max(shown_scores.values())
+            leaders = [model + (" [IGNORED]" if model in ignored else " [AUTO-IGNORED]" if model in auto else "")
+                       for model in shown if shown_scores.get(model) == highest]
+            ranking_label = "Highest raw score (shown models)" if hide_ignored else "Highest raw score"
+            section_line("", ranking_label + ": " + " = ".join(leaders) + f" ({highest:.3f}).")
+        section_line("", "score = average pressure × blend price × weight; blend = 85% input price + 15% output price", "muted")
+        if columns == "ladder":
+            section_line("", "% is after switch cost vs the warm model; raw ranking is not an approved switch", "muted")
+            section_line("", "now, sample count, input and output prices: --columns full", "muted")
+        else:
+            section_line("", f"N is retained samples (max {history_size}); samples expire after {format_duration(interval_seconds * history_size)}.", "muted")
+        section_line("", f"switch requires at least {improvement_percent:g}% score improvement after switch cost, "
+                     f"{confirmations} consecutive passing checks and minimum warm time; ignored models cannot load", "muted")
+        if hide_ignored:
+            section_line("", f"{len(shown)} shown; {len(ignored)} ignored hidden; {len(auto)} auto-ignored hidden", "muted")
+    print("", flush=True)
+    discovery = manager_state.get("discovery") or {}
+    catalog = manager_state.get("catalog") or {}
+    pricing = manager_state.get("pricing_status") or {}
+    def fetched(source: dict[str, Any]) -> str:
+        at = source.get("fetched_at")
+        return f", fetched {timeline_clock(at, now)}" if at else ""
+    section_line("sources", f"discovery {discovery.get('status', 'unknown')}, local scan  "
+                 f"catalog {catalog.get('status', 'unavailable')}, {len(catalog.get('models') or [])} models{fetched(catalog)}  "
+                 f"prices {pricing.get('status', 'unknown')}{fetched(pricing)}")
+    if recovering and (not recover_routing or not apply):
+        recovery_status = "saved recovery is paused; run --apply --recover-routing required"
+    elif not recover_routing:
+        recovery_status = "off (--recover-routing)"
+    elif not apply:
+        recovery_status = "DRY RUN; no recovery actions"
+    else:
+        recovery_status = f"{recovery.get('phase', 'waiting')}, {recovery.get('reason', 'waiting for one warm model')}"
+    section_line("", "recovery " + recovery_status)
+    if not hourly_probes:
+        section_line("", "probes off (--hourly-probes)", "muted")
 
 
 class Manager:
@@ -1732,6 +1726,9 @@ class Manager:
         self.stop_requested = False
         self.next_probe_at = 0.0
         self.next_recovery_at = 0.0
+        self.next_check_at: float | None = None
+        self.report_decision = Decision(None, "waiting for the next score check")
+        self.report_current: str | None = None
 
     def stop(self, _signum: int, _frame: Any) -> None:
         self.stop_requested = True
@@ -2069,8 +2066,16 @@ class Manager:
                 details.append(f"{label}={result[key]}")
         log(f"{probe_label}: {result['outcome']}; model={json.dumps(model)}; {http_result}; "
             + "; ".join(details))
-        for line in probe_schedule_lines(manager_state, time.time(), True, True):
-            log(line)
+        report_now = time.time()
+        # A provider/model change between score checks invalidates that forecast.
+        report_decision = (self.report_decision if warm_selection_matches(daemon, self.report_current)
+                           else Decision(None, "waiting for a fresh score check"))
+        events, notes = report_timeline(
+            manager_state, daemon, self.report_current, report_decision, report_now,
+            (self.next_check_at or report_now + self.args.check_every) if self.args.mode == "run" else None, self.args.check_every,
+            self.args.switch_after_checks, self.args.min_warm_time, True,
+            self.args.recover_routing, True)
+        print_timeline(events, notes, report_now)
         # Show the HTTP result even if saving its diagnostic summary fails.
         write_json_atomic(self.state_path, manager_state)
 
@@ -2126,13 +2131,15 @@ class Manager:
         if not isinstance(existing, dict):
             raise ValueError("invalid manager state")
         if routing_recovery(existing).get("phase") in RECOVERY_ACTIVE_PHASES:
-            print("\n" + "=" * 95, flush=True)
-            stamp = datetime.fromtimestamp(now).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-            print(f"Darkbloom Warm Model Manager ({MANAGER_VERSION})  |  {stamp}", flush=True)
-            print(f"Darkbloom: {daemon_status_line(read_daemon_state(self.args.daemon_state))}", flush=True)
-            for line in recovery_lines(existing, now, self.args.recover_routing, self.args.apply):
-                print(line, flush=True)
-            print("Model switching and regular probes paused until recovery finishes.", flush=True)
+            print_report(
+                [], {}, {}, {}, {}, {}, {}, existing,
+                read_daemon_state(self.args.daemon_state), None,
+                Decision(None, "routing recovery in progress"), self.args.apply,
+                self.args.check_every, self.args.average_samples, self.args.switch_after_checks,
+                now, None, self.ignored, [], None, self.args.switch_improvement_percent,
+                self.args.hide_ignored, self.args.hourly_probes, self.args.recover_routing,
+                self.args.columns, self.args.switch_cost, self.args.decision_horizon,
+                self.args.min_warm_time, (self.next_check_at or now + self.args.check_every) if self.args.mode == "run" else None)
             return
         manager_state = {
             key: value for key, value in existing.items()
@@ -2301,20 +2308,11 @@ class Manager:
             current,
             now,
         )
-        forecast = switch_forecast(
-            current,
-            decision,
-            manager_state,
-            daemon,
-            now,
-            self.args.check_every,
-            self.args.switch_after_checks,
-            self.args.min_warm_time,
-        )
         blocked = switch_block_reason(
             decision, eligible_models, manager_state, daemon, now, self.args.min_warm_time,
         )
 
+        self.report_current, self.report_decision = current, decision
         print_report(
             self.models,
             samples,
@@ -2333,7 +2331,6 @@ class Manager:
             self.args.switch_after_checks,
             now,
             residency,
-            forecast,
             self.ignored,
             eligible_models,
             blocked,
@@ -2341,6 +2338,9 @@ class Manager:
             self.args.hide_ignored,
             self.args.hourly_probes,
             self.args.recover_routing,
+            self.args.columns, self.args.switch_cost, self.args.decision_horizon,
+            self.args.min_warm_time,
+            (self.next_check_at or now + self.args.check_every) if self.args.mode == "run" else None,
         )
         selection_matches = warm_selection_matches(
             daemon,
@@ -2422,6 +2422,7 @@ class Manager:
                 if self.args.apply else "routing recovery disabled in dry run; no prompts or provider commands")
         while not self.stop_requested:
             started = time.monotonic()
+            self.next_check_at = time.time() + self.args.check_every
             try:
                 self.recovery_if_due()
                 self.iteration()
@@ -2434,8 +2435,7 @@ class Manager:
             remaining = max(0.0, self.args.check_every - (time.monotonic() - started))
             if not self.stop_requested:
                 log(
-                    f"manager is running; next check in {format_duration(remaining)} (--check-every) "
-                    "(Ctrl-C to stop)"
+                    f"next check in {format_duration(remaining)}. Ctrl-C stops."
                 )
             deadline = time.monotonic() + remaining
             while not self.stop_requested and time.monotonic() < deadline:
@@ -2502,6 +2502,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recover-routing", action="store_true", help="optional routing recovery: after 15m warm and 3 local successes/self-route model_not_loaded failures 5m apart, stop for 15m and start the same model once; requires run --apply, local endpoint and production token; reset-recovery clears an inactive attempt")
     parser.add_argument("--prod-token-file", type=Path, default=DEFAULT_PROD_TOKEN_PATH, help="private production token file; save with set-prod-token (default ~/.darkbloom/warm-model-manager-prod-token)")
     parser.add_argument("--local-endpoint-file", type=Path, default=DEFAULT_LOCAL_ENDPOINT_PATH, help="Darkbloom local endpoint metadata (default ~/.darkbloom/local.json; respects DARKBLOOM_LOCAL_DIR)")
+    parser.add_argument("--columns", choices=("ladder", "full"), default="ladder", help="score display: ladder (default) or full table with current pressure, sample count and separate prices")
     parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible unless --hide-ignored is set (default: all locally discovered models)")
     parser.add_argument(
         "--ignore-model", "--ignore", action="extend", nargs="+", default=[], metavar="MODEL_ID",
@@ -2509,7 +2510,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hide-ignored", action="store_true",
-        help="hide ignored and auto-ignored models from the table and its ranking; keep their calculations in saved state",
+        help="hide ignored and auto-ignored models from the display and its ranking; keep their calculations in saved state",
     )
     parser.add_argument(
         "--weight",

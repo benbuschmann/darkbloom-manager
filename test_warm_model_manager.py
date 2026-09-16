@@ -52,7 +52,10 @@ from warm_model_manager import (
     probe_credentials,
     probe_debug_text,
     probe_response_details,
-    probe_schedule_lines,
+    report_timeline,
+    print_timeline,
+    score_distance,
+    switch_ready_at,
     read_daemon_state,
     reconcile_pending_switch,
     render_preload_model_config,
@@ -60,7 +63,6 @@ from warm_model_manager import (
     send_probe,
     switch_model,
     switch_block_reason,
-    switch_forecast,
     track_current_residency,
     update_pressure_history,
     warm_selection_matches,
@@ -82,9 +84,17 @@ def setUpModule() -> None:
         unittest.addModuleCleanup(guard.stop)
 
 
+def timeline_lines(state, now, enabled=True, apply=True):
+    events, notes = report_timeline(state, None, None, Decision(None, "test"), now,
+                                   now + 60, 60, 3, 2700, enabled, False, apply)
+    with redirect_stdout(io.StringIO()) as output:
+        print_timeline(events, notes, now)
+    return output.getvalue().splitlines()
+
+
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.9")
+        self.assertEqual(MANAGER_VERSION, "0.1.10")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -622,43 +632,17 @@ class RuntimeForecastTests(unittest.TestCase):
         self.assertEqual(dwell_anchor({"last_switch_at": 10_100}, daemon), 10_100)
 
     def test_switch_eta_waits_for_confirmations_and_dwell(self) -> None:
-        forecast = switch_forecast(
-            "gemma",
-            Decision(
-                "gemma",
-                "q36 meets the 25% improvement requirement; 1/3 consecutive checks passed",
-                challenger="q36",
-                challenger_streak=1,
-            ),
-            {"last_switch_at": 1_500},
-            self.daemon(started_at=1_000),
-            now=1_600,
-            interval_seconds=60,
-            confirmations=3,
-            min_dwell_seconds=1_800,
-        )
-        assert forecast is not None
-        self.assertIn("about 29 minutes", forecast)
-        self.assertIn("keeps meeting the percentage requirement", forecast)
+        at = switch_ready_at("gemma", Decision("gemma", "passing", "q36", 1),
+                             {"last_switch_at": 1500}, self.daemon(started_at=1000),
+                             1600, 1660, 60, 3, 1800)
+        self.assertEqual(at, 3340)  # First check at/after both requirements.
+
 
     def test_margin_failing_contender_has_no_false_countdown(self) -> None:
-        forecast = switch_forecast(
-            "gemma",
-            Decision(
-                "gemma",
-                "q36 does not meet the 25% improvement requirement",
-                challenger="q36",
-            ),
-            {"last_switch_at": 1_000},
-            self.daemon(),
-            now=2_000,
-            interval_seconds=60,
-            confirmations=3,
-            min_dwell_seconds=1_800,
-        )
-        assert forecast is not None
-        self.assertIn("no estimate yet", forecast)
-        self.assertIn("does not meet the required percentage improvement", forecast)
+        at = switch_ready_at("gemma", Decision("gemma", "below margin", "q36", 0),
+                             {"last_switch_at": 1000}, self.daemon(), 2000, 2060, 60, 3, 1800)
+        self.assertIsNone(at)
+
 
 
 class DaemonStateTests(unittest.TestCase):
@@ -1149,8 +1133,8 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("local probe: SENDING", report)
         self.assertIn("local probe: SUCCESS", report)
         self.assertIn("seconds=0.25", report)
-        self.assertIn("Probe 1:   production", report)
-        self.assertIn("Probe 2:   local", report)
+        self.assertIn("probe, production self-route", report)
+        self.assertIn("probe, local endpoint", report)
         for key, value in self.saved.items():
             self.assertEqual(state[key], value)
         self.assertNotIn("fixture-", self.state.read_text() + report)
@@ -1335,8 +1319,8 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("production probe (after switch): SENDING", output)
         self.assertIn("route=self", output)
         self.assertIn("production probe (after switch): SUCCESS", output)
-        self.assertIn("Probe 1:   production", output)
-        self.assertIn("Probe 2:   local", output)
+        self.assertIn("probe, production self-route", output)
+        self.assertIn("probe, local endpoint", output)
         self.manager = Manager(self.args)
         self.tick(10181)
         self.send.assert_called_once()
@@ -1406,10 +1390,10 @@ class ProbeTests(unittest.TestCase):
 
     def test_extra_probe_appears_in_next_two_and_regular_probe_can_run_first(self):
         state = self.queue_switch_probe(10100)
-        lines = probe_schedule_lines(state, 10000, True, True)
-        self.assertIn("Probe 1:   production at", lines[0])
-        self.assertIn("Probe 2:   production (after switch)", lines[1])
-        self.assertIn("in 3m", lines[1])
+        lines = [line for line in timeline_lines(state, 10000, True, True) if "probe," in line]
+        self.assertIn("probe, production self-route", lines[0])
+        self.assertIn("probe, production self-route after switch", lines[1])
+        self.assertEqual(len(lines), 3)  # Neither regular endpoint is hidden by the extra probe.
         self.tick(10100)
         self.tick(10179)
         self.send.assert_called_once()
@@ -1512,30 +1496,28 @@ class ProbeTests(unittest.TestCase):
                 build.return_value.open.assert_called_once()
         self.assertIsNone(ProbeRedirectHandler().redirect_request(None, None, 302, "", {}, "https://other.invalid"))
 
-    def test_report_schedule_shows_both_endpoints_countdowns_and_overdue_estimate(self):
+    def test_report_schedule_shows_both_endpoints_and_overdue_estimate(self):
         state = {"probes": {"next_kind": "production", "next_at": 11800}}
-        lines = probe_schedule_lines(state, 10000, True, True)
-        self.assertIn("production", lines[0])
-        self.assertIn("in 30m", lines[0])
-        self.assertIn("local", lines[1])
-        self.assertIn("in 60m", lines[1])
-        self.assertRegex(lines[0], r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
-        overdue = probe_schedule_lines(state, 12000, True, True)
-        self.assertIn("overdue", overdue[0])
-        self.assertIn("estimated, 30m after production attempt", overdue[1])
+        events, _ = report_timeline(state, None, None, Decision(None, "test"), 10000,
+                                    10060, 60, 3, 2700, True, False, True)
+        self.assertEqual([event.at for event in events], [10060, 11800, 13600])
+        self.assertIn("production", events[1].text)
+        self.assertIn("local", events[2].text)
+        overdue = "\n".join(timeline_lines(state, 12000))
+        self.assertIn("overdue", overdue)
+        self.assertIn("estimated, 30m after the preceding regular attempt", overdue)
         self.assertEqual(state["probes"]["next_at"], 11800)
 
     def test_initial_and_disabled_schedules_are_honest(self):
-        initial = probe_schedule_lines({}, 10000, True, True)
-        self.assertIn("local", initial[0])
-        self.assertIn("due now", initial[0])
-        self.assertIn("production", initial[1])
-        for enabled, apply, text in ((False, True, "OFF"), (True, False, "DRY RUN")):
-            with self.subTest(enabled=enabled, apply=apply):
-                lines = probe_schedule_lines(self.saved, 10000, enabled, apply)
-                self.assertEqual(len(lines), 1)
-                self.assertIn(text, lines[0])
-                self.assertNotIn("Probe 1", lines[0])
+        initial = "\n".join(timeline_lines({}, 10000))
+        self.assertIn("local", initial)
+        self.assertIn("due now", initial)
+        self.assertIn("production", initial)
+        for enabled, apply in ((False, True), (True, False)):
+            text = "\n".join(timeline_lines(self.saved, 10000, enabled, apply))
+            self.assertNotIn("probe,", text)
+            if enabled:
+                self.assertIn("DRY RUN", text)
 
     def test_api_error_code_and_message_are_available_without_credentials(self):
         body = json.dumps({"error": {"code": "model_not_loaded",
@@ -1602,8 +1584,8 @@ class ProbeTests(unittest.TestCase):
                 self.manager.probe_if_due()
         self.assertIn("probe: SUCCESS", report.getvalue())
         self.assertIn("HTTP 200", report.getvalue())
-        self.assertIn("Probe 1:   production", report.getvalue())
-        self.assertIn("Probe 2:   local", report.getvalue())
+        self.assertIn("probe, production self-route", report.getvalue())
+        self.assertIn("probe, local endpoint", report.getvalue())
         self.assertEqual(json.loads(self.state.read_text())["probes"]["next_at"], 11800)
 
     def test_failed_probe_logs_specific_error_and_keeps_the_schedule(self):
@@ -1613,7 +1595,7 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("probe: FAILED", report)
         self.assertIn("HTTP 401", report)
         self.assertIn("error=invalid_api_key: key is invalid", report)
-        self.assertIn("Probe 1:   production", report)
+        self.assertIn("probe, production self-route", report)
         self.assertEqual(state["probes"]["next_at"], 11800)
 
 
@@ -2117,6 +2099,232 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.launch.assert_called_once()
 
 
+class TimelineReportTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 10000
+        self.daemon = LocalDaemonState("warm", ("warm",), False, 123, 9000, True)
+        self.decision = Decision("warm", "candidate passes; 2/3 consecutive checks passed", "candidate", 2)
+        self.state = {
+            "probes": {"next_kind": "local", "next_at": 10800},
+            "switch_probe": {"target": "warm", "pid": 123, "due_at": 10180},
+            "routing_recovery": {"schema": 1, "phase": "monitoring", "attempted": False,
+                                 "next_check_at": 10090, "reason": "network requests reached this provider"},
+        }
+
+    def timeline(self, **overrides):
+        values = dict(state=self.state, daemon=self.daemon, current="warm", decision=self.decision,
+                      now=self.now, next_check=10060, interval=60, confirmations=3, minimum=1120,
+                      hourly_probes=True, recover_routing=True, apply=True)
+        values.update(overrides)
+        return report_timeline(**values)
+
+    def render(self, **overrides):
+        values = dict(
+            models=["warm", "candidate", "ignored", "missing"],
+            samples={model: CapacitySample(model, 1, 1, 1) for model in ("warm", "candidate", "ignored")},
+            averages={"warm": 1, "candidate": 3, "ignored": 20},
+            weights={"candidate": 1.25},
+            prices={model: ModelPrice(1, 1) for model in ("warm", "candidate", "ignored")},
+            scores={"warm": 1, "candidate": 3.75, "ignored": 20},
+            pressure_history={"warm": [{"at": 10000, "pressure": 1}]},
+            manager_state={**self.state, "last_score_snapshot": {"models": {
+                "ignored": {"ignored": True, "status": ["IGNORED"]},
+                "missing": {"auto_ignored": True, "status": ["AUTO-IGNORED", "capacity unavailable"]},
+            }}},
+            daemon=self.daemon, current="warm", decision=self.decision, apply=True,
+            interval_seconds=60, history_size=15, confirmations=3, now=self.now,
+            residency=(1000, 9000), ignored_models={"ignored"}, eligible_models=["warm", "candidate"],
+            blocked=None, improvement_percent=25, hide_ignored=False, hourly_probes=True,
+            recover_routing=True, next_check=10060, minimum=1120,
+        )
+        values.update(overrides)
+        with redirect_stdout(io.StringIO()) as output:
+            manager_module.print_report(**values)
+        return output.getvalue()
+
+    def test_every_timer_sorted_without_losing_either_regular_probe(self):
+        before = json.dumps(self.state, sort_keys=True)
+        events, notes = self.timeline()
+        self.assertEqual([event.at for event in events], [10060, 10090, 10120, 10180, 10800, 12600])
+        self.assertIn("check 3 of 3", events[0].text)
+        self.assertIn("recovery check", events[1].text)
+        self.assertIn("earliest switch", events[2].text)
+        self.assertIn("if checks still pass", events[2].text)
+        self.assertIn("after switch to warm", events[3].text)
+        self.assertIn("local endpoint", events[4].text)
+        self.assertIn("production self-route", events[5].text)
+        self.assertEqual(notes, [])
+        self.assertEqual(json.dumps(self.state, sort_keys=True), before)
+
+    def test_final_passing_check_and_earliest_switch_share_one_event(self):
+        events, _ = self.timeline(minimum=0)
+        score_events = [event for event in events if event.attention]
+        self.assertEqual(len(score_events), 1)
+        self.assertIn("check 3 of 3", score_events[0].text)
+        self.assertIn("earliest switch if checks still pass", score_events[0].text)
+
+    def test_no_false_switch_time_for_below_margin_or_pending_warmup(self):
+        for decision, pending in ((Decision("warm", "below margin", "candidate", 0), False),
+                                  (Decision("candidate", "loading", warming=True), False),
+                                  (self.decision, True)):
+            state = dict(self.state)
+            if pending:
+                state["pending_switch"] = {"target": "candidate"}
+            events, _ = self.timeline(state=state, decision=decision)
+            self.assertFalse(any("earliest" in event.text for event in events))
+            if pending or decision.warming:
+                self.assertTrue(any("check pending model warm-up" in event.text for event in events))
+
+    def test_post_switch_without_confirmed_time_is_a_relative_note(self):
+        state = dict(self.state)
+        state.pop("switch_probe")
+        events, notes = self.timeline(state=state)
+        self.assertFalse(any("after switch" in event.text for event in events))
+        self.assertIn("+3m after a switch is confirmed warm", " ".join(notes))
+
+    def test_once_has_no_recurring_or_future_requests(self):
+        events, notes = self.timeline(next_check=None)
+        self.assertEqual(events, [])
+        self.assertIn("one check only", notes[0])
+        self.state["probes"]["next_at"] = 9900
+        self.state["switch_probe"]["due_at"] = 9800
+        events, _ = self.timeline(next_check=None)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].at, 9800)
+
+    def test_once_same_time_probe_tie_matches_execution_priority(self):
+        self.state["probes"]["next_at"] = 10000
+        self.state["switch_probe"]["due_at"] = 10000
+        events, _ = self.timeline(next_check=None)
+        self.assertEqual(len(events), 1)
+        self.assertIn("after switch", events[0].text)
+        self.assertEqual(manager_module.next_probe_event(self.state, 10000), ("production", 10000, True))
+
+    def test_recovery_does_not_promise_checks_after_its_verification_deadline(self):
+        self.state["routing_recovery"].update(phase="verifying", verify_by=10080)
+        events, _ = self.timeline()
+        self.assertEqual([event.at for event in events], [10060, 10080])
+        self.assertFalse(any("recovery check," in event.text for event in events))
+
+    def test_dry_run_shows_conditional_selection_but_no_sending_or_recovery(self):
+        events, notes = self.timeline(apply=False)
+        self.assertEqual([event.at for event in events], [10060, 10120])
+        self.assertIn("earliest would switch", events[1].text)
+        self.assertIn("DRY RUN", " ".join(notes))
+
+    def test_recovery_offline_has_restart_but_no_switch_or_probe(self):
+        self.state["routing_recovery"].update(phase="offline", restart_at=10900, model="warm")
+        events, notes = self.timeline()
+        self.assertEqual([event.at for event in events], [10060, 10900])
+        self.assertIn("score checks paused", events[0].text)
+        self.assertIn("15m remaining", events[1].text)
+        self.assertIn("probes paused", " ".join(notes))
+        text = self.render()
+        self.assertIn("RECOVERY OFFLINE", text)
+        self.assertIn("no fresh ranking", text)
+        self.assertNotIn("Highest raw score", text)
+
+    def test_saved_recovery_without_enabled_live_run_promises_no_restart(self):
+        self.state["routing_recovery"].update(phase="offline", restart_at=10900, model="warm")
+        for apply, enabled in ((False, True), (True, False)):
+            events, notes = self.timeline(apply=apply, recover_routing=enabled)
+            self.assertEqual(len(events), 1)
+            self.assertNotIn("restart warm", events[0].text)
+            self.assertIn("saved recovery is paused", " ".join(notes))
+
+    def test_recovery_verification_deadline_is_in_time_order(self):
+        self.state["routing_recovery"].update(phase="verifying", verify_by=10200)
+        events, _ = self.timeline()
+        self.assertEqual([event.at for event in events], [10060, 10090, 10200])
+        self.assertIn("no second restart", events[-1].text)
+
+    def test_long_minimum_rounds_to_real_check_cadence(self):
+        at = switch_ready_at("warm", self.decision, {}, self.daemon,
+                             10000, 10042, 60, 3, 1180)
+        self.assertEqual(at, 10222)
+        # An immediate approved switch stays conditional on the provider being idle.
+        events, _ = self.timeline(daemon=replace(self.daemon, inference_active=True),
+                                 decision=Decision("candidate", "passed", "candidate", 3), minimum=0)
+        self.assertEqual(events[0].at, 10000)
+        self.assertIn("online and idle", events[0].text)
+
+    def test_distance_uses_switch_cost_without_discounting_the_warm_score(self):
+        self.assertEqual(score_distance(2, 1, 300, 3600), "+83%")
+        self.assertEqual(score_distance(0.5, 1, 300, 3600), "-54%")
+        self.assertEqual(score_distance(1, 1, 0, 3600), "+0%")
+        self.assertEqual(score_distance(2, 0, 300, 3600), "> zero")
+        self.assertEqual(score_distance(0, 0, 300, 3600), "equal zero")
+        self.assertEqual(score_distance(None, 1, 300, 3600), "N/A")
+        self.assertEqual(score_distance(1, None, 300, 3600), "N/A")
+
+    def test_ladder_sorted_with_ignored_leader_and_missing_data_last(self):
+        text = self.render()
+        rows = [line for line in text.splitlines() if "avg " in line]
+        self.assertIn("ignored", rows[0])
+        self.assertIn("IGNORED", rows[0])
+        self.assertIn("candidate", rows[1])
+        self.assertIn("+244%", rows[1])
+        self.assertIn("×1.25", rows[1])
+        self.assertIn("* warm", rows[2])
+        self.assertIn("missing", rows[3])
+        self.assertIn("N/A", rows[3])
+        self.assertIn("LIVE, KEEP", text)
+        self.assertIn("Highest raw score: ignored [IGNORED]", text)
+        self.assertNotIn("earliest switch to ignored", text)
+        self.assertNotIn("IN$/M", text)
+        self.assertNotIn("OUT$/M", text)
+        self.assertNotIn("\033", text)
+        self.assertEqual([line.split()[0] for line in text.splitlines()
+                          if line.startswith(("now ", "next ", "score ", "sources "))],
+                         ["now", "next", "score", "sources"])
+
+    def test_full_restores_all_columns_inside_same_timeline(self):
+        text = self.render(columns="full")
+        header = next(line for line in text.splitlines() if line.startswith("score "))
+        for column in ("NOW", "AVG 15m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "WEIGHT", "SCORE", "STATUS"):
+            self.assertIn(column, header)
+        self.assertIn("probe, local endpoint", text)
+        self.assertIn("recovery check", text)
+        self.assertNotIn("VS WARM", text)
+
+    def test_hidden_rows_do_not_affect_ladder_bar_or_leader(self):
+        text = self.render(hide_ignored=True)
+        self.assertNotIn("  ignored ", text)
+        self.assertNotIn("  missing ", text)
+        self.assertIn("1 ignored hidden; 1 auto-ignored hidden", text)
+        self.assertIn("Highest raw score (shown models): candidate", text)
+        candidate = next(line for line in text.splitlines() if "avg " in line and "candidate" in line)
+        self.assertIn("############", candidate)
+
+    def test_no_single_fresh_warm_model_means_no_percentage_baseline(self):
+        for daemon in (None, replace(self.daemon, fresh=False), replace(self.daemon, warm_models=("warm", "other"))):
+            text = self.render(daemon=daemon)
+            rows = [line for line in text.splitlines() if "avg " in line]
+            self.assertTrue(all("N/A" in line for line in rows))
+            self.assertNotIn("+244%", text)
+
+    def test_dates_are_shown_for_events_across_midnight(self):
+        from datetime import datetime
+        now = datetime(2026, 9, 16, 23, 59, 40).timestamp()
+        self.assertEqual(manager_module.timeline_clock(now, now), "23:59:40")
+        self.assertEqual(manager_module.timeline_clock(now + 60, now), "Sep 17 00:00:40")
+
+    def test_color_only_on_terminal_and_no_color_respected(self):
+        with patch("warm_model_manager.sys.stdout.isatty", return_value=True), \
+                patch.dict("os.environ", {"TERM": "xterm"}, clear=True):
+            self.assertEqual(manager_module.terminal_style("warm", "warm"), "\033[1mwarm\033[0m")
+            with patch.dict("os.environ", {"NO_COLOR": ""}):
+                self.assertEqual(manager_module.terminal_style("warm", "warm"), "warm")
+            with patch.dict("os.environ", {"TERM": "dumb"}):
+                self.assertEqual(manager_module.terminal_style("warm", "warm"), "warm")
+
+    def test_columns_defaults_and_validation(self):
+        self.assertEqual(build_parser().parse_args([]).columns, "ladder")
+        self.assertEqual(build_parser().parse_args(["--columns", "full"]).columns, "full")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            build_parser().parse_args(["--columns", "unknown"])
+
+
 class ManagerIntegrationTests(unittest.TestCase):
     """Exercise full ticks using fake network, discovery, daemon and launch calls."""
     def setUp(self) -> None:
@@ -2164,6 +2372,22 @@ class ManagerIntegrationTests(unittest.TestCase):
     def save(self, state):
         self.path.write_text(json.dumps(state))
 
+    def test_columns_only_changes_presentation_not_selection_or_saved_state(self):
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=10)
+        self.args.mode = "run"
+        baseline, _ = self.tick()
+        results = []
+        for columns in ("ladder", "full"):
+            self.save(baseline)
+            self.args.columns = columns
+            self.manager = Manager(self.args)
+            self.launch.reset_mock()
+            state, output = self.tick(10060)
+            results.append((state, self.launch.call_args_list))
+            self.assertIn("IN$/M" if columns == "full" else "VS WARM", output)
+        self.assertEqual(results[0], results[1])
+
     def test_normal_checks_preserve_probe_schedule_and_scoring_state(self):
         state, _ = self.tick()
         schedule = {"next_kind": "production", "next_at": 11800,
@@ -2177,6 +2401,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.launch.assert_not_called()
 
     def test_switch_probe_starts_at_confirmed_warmup_and_survives_checks_and_restart(self):
+        self.args.mode = "run"
         self.args.hourly_probes = True
         state, _ = self.tick()
         self.assertNotIn("switch_probe", state)  # Already warm at startup.
@@ -2193,8 +2418,8 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(confirmed["switch_probe"]["due_at"], 10300)
         self.assertEqual(confirmed["switch_probe"]["target"], "good")
         self.assertEqual(self.manager.next_probe_at, 0)
-        self.assertIn("Probe 1:   production (after switch)", report)
-        self.assertIn("Probe 2:   production at", report)
+        self.assertIn("probe, production self-route after switch", report)
+        self.assertIn("probe, production self-route", report)
         self.manager = Manager(self.args)
         after, _ = self.tick(10180)
         self.assertEqual(after["switch_probe"], confirmed["switch_probe"])
@@ -2246,18 +2471,19 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.launch.assert_not_called()
 
     def test_every_report_shows_next_two_probes_after_restart_without_sending(self):
+        self.args.mode = "run"
         self.args.hourly_probes = True
         state, initial = self.tick()
-        self.assertIn("Probe 1:   local", initial)
+        self.assertIn("probe, local endpoint", initial)
         self.assertIn("due now", initial)
-        self.assertIn("Probe 2:   production", initial)
+        self.assertIn("probe, production self-route", initial)
         state["probes"] = {"next_kind": "production", "next_at": 11800}
         self.save(state)
         self.manager = Manager(self.args)
         for now in (10060, 10120):
             _, report = self.tick(now)
-            self.assertIn("Probe 1:   production", report)
-            self.assertIn("Probe 2:   local", report)
+            self.assertIn("probe, production self-route", report)
+            self.assertIn("probe, local endpoint", report)
             self.assertNotIn("SENDING", report)
         self.launch.assert_not_called()
 
@@ -2279,11 +2505,12 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(state["last_decision_target"], "good")
         self.assertNotIn(IGNORED, report)
         self.assertIn("Highest raw score (shown models): good (0.500).", report)
-        self.assertIn("Models:    1 shown; 1 ignored hidden; 0 auto-ignored hidden", report)
+        self.assertIn("1 shown; 1 ignored hidden; 0 auto-ignored hidden", report)
         self.assertNotIn("WOULD SWITCH", report)
         self.launch.assert_not_called()
 
     def test_hidden_models_do_not_widen_table_and_missing_data_stays_visible(self) -> None:
+        self.args.columns = "full"
         self.args.hide_ignored = True
         hidden = "not-downloaded-" + "x" * 150
         self.catalog.return_value = {"good", "missing-data", hidden}
@@ -2293,13 +2520,13 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertNotIn(IGNORED, report)
         self.assertTrue(state["last_score_snapshot"]["models"][hidden]["auto_ignored"])
         self.assertFalse(state["last_score_snapshot"]["models"]["missing-data"]["auto_ignored"])
-        row = next(line for line in report.splitlines() if line.startswith("  missing-data"))
+        row = next(line for line in report.splitlines() if line.startswith("           missing-data"))
         self.assertIn("N/A", row)
         self.assertIn("capacity unavailable", row)
-        header = next(line for line in report.splitlines() if line.startswith("MODEL ID"))
-        self.assertEqual(header.index("NOW"), 29)
-        self.assertIn("Models:    2 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
-        self.assertIn("\n\nHighest raw score (shown models): good (0.500).", report)
+        header = next(line for line in report.splitlines() if line.startswith("score    MODEL ID"))
+        self.assertEqual(header.index("NOW"), 38)
+        self.assertIn("2 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
+        self.assertIn("\n\n         Highest raw score (shown models): good (0.500).", report)
         self.launch.assert_not_called()
 
     def test_multiple_ignored_ids_are_hidden_and_block_saved_launches_through_cli(self) -> None:
@@ -2334,7 +2561,7 @@ class ManagerIntegrationTests(unittest.TestCase):
                     report = output.getvalue()
                     self.assertEqual(state["last_decision_target"], "good")
                     if hide:
-                        self.assertIn("Models:    1 shown; 3 ignored hidden; 0 auto-ignored hidden", report)
+                        self.assertIn("1 shown; 3 ignored hidden; 0 auto-ignored hidden", report)
                     else:
                         self.assertNotIn("ignored hidden", report)
                     for model in ignored:
@@ -2380,6 +2607,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.launch.assert_called_once_with("darkbloom", "candidate", None, {IGNORED})
 
     def test_blended_winner_obeys_cost_margins_and_three_checks_in_live_and_dry_run(self) -> None:
+        self.args.columns = "full"
         q35, q9 = "qwen3.5-35b-a3b", "Qwen3.5-9B"
         self.local.return_value = {q35, q9}
         self.capacity.return_value = self.samples(**{q35: 1, q9: 4})
@@ -2408,12 +2636,12 @@ class ManagerIntegrationTests(unittest.TestCase):
                 else:
                     self.launch.assert_not_called()
                     self.assertIn("WOULD SWITCH", report)
-                header = next(line for line in report.splitlines() if line.startswith("MODEL ID"))
-                self.assertEqual(header.split(), ["MODEL", "ID", "NOW", "AVG", "5m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "WEIGHT", "SCORE", "STATUS"])
-                q9_row = next(line for line in report.splitlines() if line.startswith("  " + q9))
+                header = next(line for line in report.splitlines() if line.startswith("score    MODEL ID"))
+                self.assertEqual(header.split()[1:], ["MODEL", "ID", "NOW", "AVG", "5m", "N", "IN$/M", "OUT$/M", "BLEND$/M", "WEIGHT", "SCORE", "STATUS"])
+                q9_row = next(line for line in report.splitlines() if line.startswith("           " + q9))
                 self.assertEqual(q9_row.split()[4:9], ["0.0800", "0.1300", "0.0875", "1.00", "0.350"])
                 self.assertIn("\n" + "=" * len(header) + "\n", report)
-                self.assertIn("\n\nHighest raw score:", report)
+                self.assertIn("\n\n         Highest raw score:", report)
                 self.assertIn("85% input price + 15% output price", report)
                 self.assertNotIn("PROJ$/M", report)
 
@@ -2550,7 +2778,7 @@ class ManagerIntegrationTests(unittest.TestCase):
                 self.assertFalse(row["eligible"])
                 self.assertNotIn(remote, report)
                 self.assertNotIn("catalog-only", report)
-                self.assertIn("Models:    1 shown; 1 ignored hidden; 2 auto-ignored hidden", report)
+                self.assertIn("1 shown; 1 ignored hidden; 2 auto-ignored hidden", report)
                 self.assertIn("Highest raw score (shown models): good (0.500).", report)
                 missing = state["last_score_snapshot"]["models"]["catalog-only"]
                 self.assertIsNone(missing["score"])
@@ -2642,7 +2870,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         row = state["last_score_snapshot"]["models"]["remote"]
         self.assertEqual(row["average_pressure"], 10)
         self.assertIsNone(row["score"])
-        self.assertIn("Catalog:   stale cache", report)
+        self.assertIn("catalog stale cache", report)
         self.assertIn("capacity unavailable; AVG retained", row["status"])
         self.catalog.side_effect = None
         self.catalog.return_value = {"good", "replacement"}
@@ -2659,7 +2887,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         state, report = self.tick()
         self.assertEqual(state["catalog"]["status"], "unavailable")
         self.assertTrue(state["last_score_snapshot"]["models"]["network-only"]["auto_ignored"])
-        self.assertIn("Catalog:   unavailable", report)
+        self.assertIn("catalog unavailable", report)
         self.assertEqual(state["last_decision_target"], "good")
         self.launch.assert_not_called()
 
@@ -2772,7 +3000,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         state, report = self.tick(11000)
         self.assertEqual(state["pricing_status"]["status"], "stale cache")
         self.assertEqual(state["pricing_status"]["fetched_at"], 10000)
-        self.assertIn("Prices:    stale cache; fetched", report)
+        self.assertIn("prices stale cache, fetched", report)
 
     def test_discovery_refresh_adds_and_removes_models_and_applies_future_weight(self) -> None:
         self.args.weight = [("future", 1.7)]
@@ -2808,8 +3036,8 @@ class ManagerIntegrationTests(unittest.TestCase):
         state, report = self.tick(10060)
         self.assertEqual(self.manager.models, before)
         self.assertIsNone(state["last_decision_target"])
-        self.assertIn("Discovery: unavailable", report)
-        self.assertIn("Models:    0 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
+        self.assertIn("discovery unavailable", report)
+        self.assertIn("0 shown; 1 ignored hidden; 1 auto-ignored hidden", report)
         self.assertIn("No models to show.", report)
         self.assertNotIn("Highest raw score", report)
         self.launch.assert_not_called()
@@ -2991,7 +3219,7 @@ class ManagerIntegrationTests(unittest.TestCase):
         state, report = self.tick()
         self.assertEqual(set(state["last_score_snapshot"]["models"]), {"good", IGNORED})
         self.assertTrue(all(row["auto_ignored"] for row in state["last_score_snapshot"]["models"].values()))
-        self.assertIn("Models:    0 shown; 0 ignored hidden; 2 auto-ignored hidden", report)
+        self.assertIn("0 shown; 0 ignored hidden; 2 auto-ignored hidden", report)
         self.assertIn("No models to show.", report)
         self.assertNotIn("Highest raw score", report)
         self.assertIn("WAIT", report)
