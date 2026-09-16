@@ -1,7 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.1.8 — 2026-09-16
 
+- With `--hourly-probes`, send one extra production self-route prompt three
+  minutes after a manager-selected model is confirmed warm. Keep its timer
+  separate from the hourly cadence, show it in the next-two-probes display,
+  and consume it before sending so interruptions cannot replay it.
+- Keep the local endpoint enabled during model switches when probes are on.
+  Preserve a live endpoint's port, bind address and authentication setting;
+  otherwise use Darkbloom's authenticated loopback default. Do not restart a
+  provider just to repair an endpoint.
+- Replace the combined local-endpoint skip message with specific missing-file,
+  unreadable-file, invalid-JSON and process-ID errors. Show both process IDs
+  when the endpoint record belongs to another process.
 - Add optional `--hourly-probes`: alternate a local prompt and a production
   self-route prompt 30 minutes apart, once per hour for each endpoint.
   Read the currently warm model each time and require `--apply` to send.

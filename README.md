@@ -101,16 +101,38 @@ endpoints. This is optional and requires `--apply`.
 | 60 minutes | Local endpoint again |
 | 90 minutes | Production API again |
 
-Each endpoint gets one attempt per hour. The manager reads the warm model
+This regular schedule gives each endpoint one attempt per hour. The manager reads the warm model
 again for every attempt, so the requests follow model changes. Each prompt
 asks for `OK`, allows up to 64 output tokens, and has a 30-second socket timeout.
 A reasoning model may use the token limit before writing `OK`.
 
+After the manager switches models, it also schedules one production self-route
+request **three minutes after the new model is confirmed warm**. The timer starts
+at warm-up confirmation, not when the launch command returns. This extra request
+uses the same saved production token and `X-Darkbloom-Route: self` header.
+It does not move the regular hourly schedule, so it can fall close to a regular
+probe. Starting the manager with an already warm model does not add an extra request.
+
+The extra request survives a manager restart and is consumed once, including
+on failure or a skip. It is cancelled if the warm model or provider process has
+changed. A later manager switch replaces it with a new timer after warm-up.
+
 The local request uses Darkbloom's saved endpoint and local token. The endpoint
-must already be enabled on the running provider. Its process ID must match
-the daemon state, and its address must be loopback. See Darkbloom's
+record's process ID must match the daemon state, and its address must be loopback.
+With probes enabled, future model switches include Darkbloom's `--local-endpoint`
+flag. The manager keeps the live endpoint's port, bind address and authentication
+setting. If no matching record is available, it uses Darkbloom's authenticated
+loopback default on port 8000. It does not restart an already warm provider just
+to enable this endpoint. See Darkbloom's
 [local endpoint instructions](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/direct-mode.md).
-The manager does not enable the endpoint or restart Darkbloom to set it up.
+
+`HTTP N/A` means no HTTP status was received. For a local `SKIPPED` result, no
+request was sent. The reason now distinguishes a missing or unreadable record,
+invalid JSON, a missing process ID, and a process mismatch. A mismatch prints
+both process IDs; check that `--local-endpoint-file` and `--daemon-state` belong
+to the same provider. A missing record can mean the local endpoint is disabled.
+Earlier probe builds omitted `--local-endpoint` during model switches, which
+could leave the endpoint disabled after a switch.
 
 Save your production API token once on each Mac:
 
@@ -138,11 +160,13 @@ See Darkbloom's [self-route documentation](https://github.com/Layr-Labs/d-infere
 
 Every report shows the next two probe times, with dates, seconds, timezone and
 countdowns. The same two lines appear after each attempt, including skipped
-or failed attempts. For example, at 10:10 AM:
+or failed attempts. The display includes the extra request when it is one of
+the next two, labeled `production (after switch)`. For example, just after a
+model is confirmed warm at 10:10 AM:
 
 ```text
-Probe 1:   production at 2026-09-16 10:30:00 PDT (in 20m)
-Probe 2:   local at 2026-09-16 11:00:00 PDT (in 50m)
+Probe 1:   production (after switch) at 2026-09-16 10:13:00 PDT (in 3m)
+Probe 2:   production at 2026-09-16 10:30:00 PDT (in 20m)
 ```
 
 An overdue turn is labeled `overdue`. Its following turn is an estimate until
@@ -178,12 +202,12 @@ or an unavailable local endpoint skip that endpoint's turn. There are no
 immediate retries.
 
 The next endpoint and time survive manager restarts. After downtime, the
-manager handles one overdue turn and schedules the other 30 minutes later.
+manager handles one overdue regular turn and schedules the other 30 minutes later.
 It does not replay missed requests. Skipped turns also advance the schedule.
 Score-check timing does not change: probes can run between checks. A slow check
 or an in-progress switch can delay a probe; a probe that runs past the next
 check time delays that check until the request returns. `once --apply --hourly-probes`
-handles at most one due turn, then exits; use `run` for the hourly schedule.
+handles at most one due request, then exits; use `run` to keep both timers active.
 
 `--prod-token-file PATH` selects another private production token file for
 both setup and requests. `--local-endpoint-file PATH` selects another
@@ -447,6 +471,7 @@ write permissions.
 | Percentage requirement, switch cost, and decision horizon | Reset passing-check counts when the switch rule changes. |
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 | Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's model, outcome, duration, HTTP status, redacted error or skip reason, finish reason, token counts and serving provider ID when available. |
+| Extra probe after a switch | Keep the target, provider process identity, warm-up confirmation and due time until the one-shot request is attempted or skipped. Retain its latest result separately from the hourly probe result. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
 The state file contains no prompts, generated replies or API keys. Probe errors

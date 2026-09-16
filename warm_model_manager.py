@@ -42,7 +42,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.7"
+MANAGER_VERSION = "0.1.8"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -69,6 +69,7 @@ DEFAULT_LOCAL_ENDPOINT_PATH = Path(os.environ.get(
 PROD_PROBE_URL = "https://api.darkbloom.dev/v1/chat/completions"
 PROBE_SPACING = 1800
 PROBE_TIMEOUT = 30
+SWITCH_PROBE_DELAY = 180
 DEFAULT_PROVIDER_CONFIG_PATH = (
     Path.home() / ".config" / "darkbloom" / "provider.toml"
 )
@@ -89,6 +90,7 @@ MANAGER_STATE_KEYS = {
     "live_challenger_model", "live_challenger_streak",
     "dry_challenger_model", "dry_challenger_streak",
     "probes",
+    "switch_probe", "last_switch_probe_result",
 }
 
 
@@ -613,9 +615,18 @@ def probe_credentials(kind: str, daemon: LocalDaemonState,
             raise ValueError("production token invalid; run set-prod-token")
         return PROD_PROBE_URL, token
 
-    info = read_json(local_path)
-    if info.get("pid") != daemon.pid:
-        raise ValueError("local endpoint is unavailable or belongs to another provider process")
+    try:
+        info = json.loads(local_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError("local endpoint record is missing; enable --local-endpoint on Darkbloom or check --local-endpoint-file") from None
+    except OSError:
+        raise ValueError("local endpoint record cannot be read; check file permissions") from None
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError("local endpoint record contains invalid JSON") from None
+    if not isinstance(info, dict) or type(info.get("pid")) is not int or info["pid"] <= 0:
+        raise ValueError("local endpoint record has no valid process ID")
+    if info["pid"] != daemon.pid:
+        raise ValueError(f"local endpoint process mismatch (endpoint pid {info['pid']}, provider pid {daemon.pid}); check --local-endpoint-file and --daemon-state")
     try:
         url = urlsplit(info.get("base_url", ""))
         loopback = ipaddress.ip_address(url.hostname or "").is_loopback
@@ -1113,11 +1124,36 @@ def synchronize_preload_model(
         raise
 
 
+def local_endpoint_start_flags(path: Path, daemon: LocalDaemonState | None) -> list[str]:
+    """Keep a live endpoint's settings, or request Darkbloom's authenticated default."""
+    flags = ["--local-endpoint"]
+    try:
+        info = read_json(path)
+    except UnicodeDecodeError:
+        return flags
+    if not daemon or not daemon.alive or not daemon.fresh or info.get("pid") != daemon.pid:
+        return flags
+    try:
+        url = urlsplit(info.get("base_url", ""))
+        host = info.get("host") or url.hostname
+        ipaddress.ip_address(host)
+        port = info.get("port", url.port)
+        if type(port) is not int or not 1 <= port <= 65535:
+            return flags
+    except (ValueError, TypeError, AttributeError):
+        return flags
+    flags.extend(["--port", str(port), "--bind", host])
+    if info.get("api_key") == "":
+        flags.append("--no-auth")
+    return flags
+
+
 def switch_model(
     darkbloom: str,
     model_id: str,
     config_path: Path | None,
     ignored_models: Iterable[str] = (),
+    local_flags: list[str] | None = None,
 ) -> None:
     if model_id in ignored_models:
         raise RuntimeError("refusing to load an ignored model")
@@ -1129,6 +1165,7 @@ def switch_model(
     if config_path:
         command.extend(["--config", str(config_path)])
     command.extend(["--model", model_id, "--idle-timeout", "0"])
+    command.extend(local_flags or [])
     result = subprocess.run(
         command,
         capture_output=True,
@@ -1213,6 +1250,24 @@ def next_probe_slot(manager_state: dict[str, Any], now: float) -> tuple[str, flo
     return schedule["next_kind"], max(0, min(schedule["next_at"], now + PROBE_SPACING))
 
 
+def pending_switch_probe(manager_state: dict[str, Any]) -> dict[str, Any] | None:
+    event = manager_state.get("switch_probe")
+    if (not isinstance(event, dict) or not isinstance(event.get("target"), str)
+            or not event["target"] or type(event.get("pid")) is not int or event["pid"] <= 0
+            or type(event.get("due_at")) not in (int, float)
+            or not math.isfinite(event["due_at"]) or event["due_at"] < 0):
+        return None
+    return event
+
+
+def next_probe_event(manager_state: dict[str, Any], now: float) -> tuple[str, float, bool]:
+    kind, at = next_probe_slot(manager_state, now)
+    event = pending_switch_probe(manager_state)
+    if event and event["due_at"] <= at:
+        return "production", event["due_at"], True
+    return kind, at, False
+
+
 def probe_schedule_lines(manager_state: dict[str, Any], now: float,
                          enabled: bool, apply: bool) -> list[str]:
     if not enabled:
@@ -1221,14 +1276,18 @@ def probe_schedule_lines(manager_state: dict[str, Any], now: float,
         return ["Probes:    DRY RUN; no prompts scheduled (--apply required)"]
     kind, at = next_probe_slot(manager_state, now)
     other = "production" if kind == "local" else "local"
+    candidates = [(kind, at, False), (other, max(now, at) + PROBE_SPACING, at <= now)]
+    event = pending_switch_probe(manager_state)
+    if event:
+        candidates.insert(0, ("production (after switch)", event["due_at"], False))
     lines = []
-    for number, endpoint, when in ((1, kind, at), (2, other, max(now, at) + PROBE_SPACING)):
+    for number, (endpoint, when, estimated) in enumerate(sorted(candidates, key=lambda item: item[1])[:2], 1):
         stamp = datetime.fromtimestamp(when).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         wait = when - now
         timing = f"in {format_duration(wait)}" if wait > 0 else "due now; next attempt"
         if wait < 0:
             timing = f"overdue by {format_duration(-wait)}; next attempt"
-        if number == 2 and at <= now:
+        if estimated:
             timing += f"; estimated, 30m after {kind} attempt"
         lines.append(f"Probe {number}:   {endpoint} at {stamp} ({timing})")
     return lines
@@ -1586,21 +1645,28 @@ class Manager:
                          if self.state_path.exists() else {})
         if not isinstance(manager_state, dict):
             raise ValueError("invalid manager state")
-        kind, due_at = next_probe_slot(manager_state, now)
+        # Keep clock correction confined to the regular schedule.
+        _, regular_at = next_probe_slot(manager_state, now)
+        if isinstance(manager_state.get("probes"), dict) and regular_at != manager_state["probes"].get("next_at"):
+            manager_state["probes"]["next_at"] = regular_at
+            write_json_atomic(self.state_path, manager_state)
+        kind, due_at, after_switch = next_probe_event(manager_state, now)
         if now < due_at:
             self.next_probe_at = due_at
-            if due_at != manager_state["probes"]["next_at"]:
-                manager_state["probes"]["next_at"] = due_at
-                write_json_atomic(self.state_path, manager_state)
             return
 
+        event = pending_switch_probe(manager_state) if after_switch else None
+        probe_label = "production probe (after switch)" if after_switch else f"{kind} probe"
         daemon = read_daemon_state(self.args.daemon_state, now=time.time())
-        model = None
+        model = event["target"] if event else None
         reason = None
         if not daemon or not daemon.alive or not daemon.fresh:
             reason = "provider state is unavailable, stale or offline"
         elif len(daemon.warm_models) != 1:
             reason = "no single warm model"
+        elif event and (daemon.warm_models[0] != event["target"] or daemon.pid != event["pid"]
+                        or daemon.started_at != event.get("daemon_started_at")):
+            reason = "model or provider process changed after warm-up; cancelled"
         else:
             model = daemon.warm_models[0]
             if model in self.ignored or (self.args.model is not None and model not in self.args.model):
@@ -1619,19 +1685,22 @@ class Manager:
         result = {"at": now, "kind": kind, "model": model, "http_status": None,
                   "outcome": "SKIPPED" if reason else "UNKNOWN",
                   "status": "skipped: " + reason if reason else "request started; result unknown"}
-        schedule = {
-            "next_kind": "production" if kind == "local" else "local",
-            "next_at": now + PROBE_SPACING,
-            "last_result": result,
-        }
-        manager_state["probes"] = schedule
+        if after_switch:
+            manager_state.pop("switch_probe", None)
+            manager_state["last_switch_probe_result"] = result
+        else:
+            manager_state["probes"] = {
+                "next_kind": "production" if kind == "local" else "local",
+                "next_at": now + PROBE_SPACING,
+                "last_result": result,
+            }
         # Commit the next slot before POST: interruption or timeout cannot replay it.
         # After downtime, try one slot and space the next 30 minutes later.
         write_json_atomic(self.state_path, manager_state)
-        self.next_probe_at = schedule["next_at"]
+        self.next_probe_at = next_probe_event(manager_state, now)[1]
         if not reason and not self.stop_requested:
             route = "; route=self" if kind == "production" else ""
-            log(f"{kind} probe: SENDING; model={json.dumps(model)}; POST {url}"
+            log(f"{probe_label}: SENDING; model={json.dumps(model)}; POST {url}"
                 f"{route}; max_tokens=64; timeout={PROBE_TIMEOUT}s")
             result.update(send_probe(kind, model, url, token))
         elif self.stop_requested and not reason:
@@ -1644,7 +1713,7 @@ class Manager:
                            ("provider_id", "provider"), ("error", "error")):
             if key in result:
                 details.append(f"{label}={result[key]}")
-        log(f"{kind} probe: {result['outcome']}; model={json.dumps(model)}; {http_result}; "
+        log(f"{probe_label}: {result['outcome']}; model={json.dumps(model)}; {http_result}; "
             + "; ".join(details))
         for line in probe_schedule_lines(manager_state, time.time(), True, True):
             log(line)
@@ -1826,6 +1895,15 @@ class Manager:
         ) if discovery_available else None
         if pending_decision is not None:
             decision = pending_decision
+            if not decision.warming and self.args.hourly_probes and self.args.apply:
+                confirmed_at = time.time()
+                manager_state["switch_probe"] = {
+                    "target": decision.target, "confirmed_at": confirmed_at,
+                    "due_at": confirmed_at + SWITCH_PROBE_DELAY,
+                    "pid": daemon.pid, "daemon_started_at": daemon.started_at,
+                }
+                # The extra request may precede the cached hourly deadline.
+                self.next_probe_at = 0.0
             manager_state[challenger_model_key] = None
             manager_state[challenger_streak_key] = 0
         elif not eligible_models or (current in local_eligible and current not in scores):
@@ -1921,6 +1999,8 @@ class Manager:
             # Persist intent before any provider change. A timed-out command
             # can still have restarted Darkbloom, and must never be retried
             # automatically just because it did not return successfully.
+            manager_state.pop("switch_probe", None)
+            self.next_probe_at = 0.0
             manager_state["pending_switch"] = {
                 "target": decision.target,
                 "warm_models": [decision.target],
@@ -1929,7 +2009,10 @@ class Manager:
             write_json_atomic(self.state_path, manager_state)
             log("switching the launchd provider to " + decision.target)
             try:
-                switch_model(self.args.darkbloom, decision.target, self.args.config, self.ignored)
+                endpoint_options = ({"local_flags": local_endpoint_start_flags(self.args.local_endpoint_file, daemon)}
+                                    if self.args.hourly_probes else {})
+                switch_model(self.args.darkbloom, decision.target, self.args.config, self.ignored,
+                             **endpoint_options)
             except Exception as error:
                 manager_state["pending_switch"]["command_error"] = str(error)
                 write_json_atomic(self.state_path, manager_state)
@@ -1956,7 +2039,8 @@ class Manager:
                 "add --apply to enable model changes"
             )
         if self.args.hourly_probes:
-            log("hourly probes enabled: local and production self-route, 30 minutes apart"
+            log("hourly probes enabled: local and production self-route, 30 minutes apart; "
+                "extra self-route request 3 minutes after confirmed switch warm-up"
                 if self.args.apply else "hourly probes disabled in dry run; --apply is required to send prompts")
         while not self.stop_requested:
             started = time.monotonic()
@@ -2030,7 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("mode", choices=("once", "run", "set-prod-token"), nargs="?", default="once")
     parser.add_argument("--apply", action="store_true", help="enable model changes and opted-in probes; default is dry-run")
-    parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart; requires --apply")
+    parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart, plus one self-route prompt 3 minutes after switch warm-up; enables the local endpoint on model switches; requires --apply")
     parser.add_argument("--prod-token-file", type=Path, default=DEFAULT_PROD_TOKEN_PATH, help="private production token file; save with set-prod-token (default ~/.darkbloom/warm-model-manager-prod-token)")
     parser.add_argument("--local-endpoint-file", type=Path, default=DEFAULT_LOCAL_ENDPOINT_PATH, help="Darkbloom local endpoint metadata (default ~/.darkbloom/local.json; respects DARKBLOOM_LOCAL_DIR)")
     parser.add_argument("--model", action="append", metavar="MODEL", help="restrict loading candidates; repeat in tie-break order; other catalog rows stay visible unless --hide-ignored is set (default: all locally discovered models)")

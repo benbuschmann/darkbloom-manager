@@ -43,6 +43,7 @@ from warm_model_manager import (
     format_duration,
     format_human_duration,
     local_model_ids,
+    local_endpoint_start_flags,
     main,
     migrate_default_state,
     pressure_samples,
@@ -78,7 +79,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.7")
+        self.assertEqual(MANAGER_VERSION, "0.1.8")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -837,6 +838,18 @@ class SingleModelLoadingTests(unittest.TestCase):
             "darkbloom", "start", "--model", "gpt-oss-20b", "--idle-timeout", "0",
         ])
 
+    def test_switch_passes_local_endpoint_options_without_credentials(self):
+        with patch("warm_model_manager.synchronize_preload_model") as sync, \
+                patch("warm_model_manager.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            switch_model("darkbloom", "good", None,
+                         local_flags=["--local-endpoint", "--port", "9000", "--bind", "::1"])
+        self.assertEqual(run.call_args.args[0], [
+            "darkbloom", "start", "--model", "good", "--idle-timeout", "0",
+            "--local-endpoint", "--port", "9000", "--bind", "::1",
+        ])
+        sync.assert_called_once_with(DEFAULT_PROVIDER_CONFIG_PATH, "good")
+
     def test_preload_renderer_preserves_other_tables(self) -> None:
         original = '[other]\npreload_models = ["unrelated"]\n[backend]\n# operator comment\n'
         rendered = render_preload_model_config(original, "good")
@@ -1249,7 +1262,7 @@ class ProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "loopback"):
                     probe_credentials("local", self.warm, self.local, self.token)
         self.local.write_text(json.dumps({"pid": 999, "base_url": "http://127.0.0.1:8000/v1"}))
-        with self.assertRaisesRegex(ValueError, "another provider"):
+        with self.assertRaisesRegex(ValueError, "endpoint pid 999, provider pid 123"):
             probe_credentials("local", self.warm, self.local, self.token)
 
     def test_local_saved_token_ipv6_and_no_auth_mode(self):
@@ -1259,6 +1272,154 @@ class ProbeTests(unittest.TestCase):
         self.local.write_text(json.dumps({"pid": 123, "base_url": "http://[::1]:9000/v1/", "api_key": ""}))
         self.assertEqual(probe_credentials("local", self.warm, self.local, self.token),
                          ("http://[::1]:9000/v1/chat/completions", ""))
+
+    def test_local_record_errors_identify_the_failure_without_printing_contents(self):
+        self.local.unlink()
+        with self.assertRaisesRegex(ValueError, "record is missing; enable --local-endpoint"):
+            probe_credentials("local", self.warm, self.local, self.token)
+        for contents, message in ((b"{PRIVATE", "invalid JSON"), (b"\xff", "invalid JSON"),
+                                  (b"[]", "no valid process ID"), (b'{"pid": true}', "no valid process ID")):
+            with self.subTest(message=message):
+                self.local.write_bytes(contents)
+                with self.assertRaisesRegex(ValueError, message) as caught:
+                    probe_credentials("local", self.warm, self.local, self.token)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+        with patch.object(Path, "read_text", side_effect=PermissionError("PRIVATE")):
+            with self.assertRaisesRegex(ValueError, "cannot be read; check file permissions"):
+                probe_credentials("local", self.warm, self.local, self.token)
+
+    def test_switch_endpoint_flags_preserve_live_settings_and_default_if_unavailable(self):
+        for host, base in (("127.0.0.1", "http://127.0.0.1:9000/v1"),
+                           ("::1", "http://[::1]:9000/v1"),
+                           ("0.0.0.0", "http://127.0.0.1:9000/v1")):
+            for token in ("PRIVATE", ""):
+                with self.subTest(host=host, authenticated=bool(token)):
+                    self.local.write_text(json.dumps({"pid": 123, "host": host, "port": 9000,
+                                                      "base_url": base, "api_key": token}))
+                    self.assertEqual(local_endpoint_start_flags(self.local, self.warm), [
+                        "--local-endpoint", "--port", "9000", "--bind", host,
+                        *([] if token else ["--no-auth"]),
+                    ])
+        for daemon in (None, replace(self.warm, pid=999), replace(self.warm, alive=False),
+                       replace(self.warm, fresh=False)):
+            self.assertEqual(local_endpoint_start_flags(self.local, daemon), ["--local-endpoint"])
+        for contents in ("{broken", "[]", '{"pid": 123, "port": "bad"}'):
+            self.local.write_text(contents)
+            self.assertEqual(local_endpoint_start_flags(self.local, self.warm), ["--local-endpoint"])
+        self.local.unlink()
+        self.assertEqual(local_endpoint_start_flags(self.local, self.warm), ["--local-endpoint"])
+
+    def queue_switch_probe(self, regular_at=11800):
+        state = {**self.saved, "probes": {"next_kind": "production", "next_at": regular_at},
+                 "switch_probe": {"target": "good", "confirmed_at": 10000, "due_at": 10180,
+                                  "pid": 123, "daemon_started_at": 100}}
+        self.state.write_text(json.dumps(state))
+        return state
+
+    def test_switch_probe_is_once_after_three_minutes_and_leaves_hourly_cadence_alone(self):
+        original = self.queue_switch_probe()
+        self.tick(10000)
+        self.manager = Manager(self.args)
+        self.tick(10179)
+        self.send.assert_not_called()
+        state, output = self.tick(10180)
+        self.send.assert_called_once_with("production", "good", PROD_PROBE_URL, "fixture-production-token")
+        self.assertNotIn("switch_probe", state)
+        self.assertEqual(state["probes"], original["probes"])
+        self.assertEqual(state["last_switch_probe_result"]["outcome"], "SUCCESS")
+        self.assertIn("production probe (after switch): SENDING", output)
+        self.assertIn("route=self", output)
+        self.assertIn("production probe (after switch): SUCCESS", output)
+        self.assertIn("Probe 1:   production", output)
+        self.assertIn("Probe 2:   local", output)
+        self.manager = Manager(self.args)
+        self.tick(10181)
+        self.send.assert_called_once()
+        self.tick(11800)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_switch_probe_consumes_intent_before_post_and_does_not_replay_after_interruption(self):
+        original = self.queue_switch_probe()
+        def interrupt(*_):
+            state = json.loads(self.state.read_text())
+            self.assertNotIn("switch_probe", state)
+            self.assertEqual(state["probes"], original["probes"])
+            self.assertEqual(state["last_switch_probe_result"]["outcome"], "UNKNOWN")
+            raise KeyboardInterrupt
+        self.send.side_effect = interrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(10180)
+        self.manager = Manager(self.args)
+        self.tick(10181)
+        self.send.assert_called_once()
+
+    def test_switch_probe_requires_same_warm_process_and_normal_probe_guards(self):
+        for daemon, ignored, models, pending, reason in (
+            (replace(self.warm, warm_models=("new",)), [], None, False, "changed after warm-up"),
+            (replace(self.warm, pid=999), [], None, False, "changed after warm-up"),
+            (replace(self.warm, started_at=999), [], None, False, "changed after warm-up"),
+            (replace(self.warm, inference_active=True), [], None, False, "serving"),
+            (replace(self.warm, fresh=False), [], None, False, "stale"),
+            (replace(self.warm, warm_models=()), [], None, False, "no single warm"),
+            (self.warm, ["good"], None, False, "ignored"),
+            (self.warm, [], ["other"], False, "excluded"),
+            (self.warm, [], None, True, "pending"),
+        ):
+            with self.subTest(reason=reason):
+                original = self.queue_switch_probe()
+                if pending:
+                    original["pending_switch"] = {"target": "next"}
+                    self.state.write_text(json.dumps(original))
+                self.daemon.return_value = daemon
+                self.args.model = models
+                self.manager = Manager(self.args)
+                self.manager.ignored = set(ignored)
+                state, output = self.tick(10180)
+                self.assertIn(reason, output)
+                self.assertIn("production probe (after switch): SKIPPED", output)
+                self.assertNotIn("switch_probe", state)
+                self.assertEqual(state["probes"], original["probes"])
+        self.send.assert_not_called()
+
+    def test_switch_probe_missing_token_and_http_failure_are_not_retried(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                original = self.queue_switch_probe()
+                self.manager = Manager(self.args)
+                self.send.reset_mock()
+                if missing:
+                    self.token.unlink()
+                self.send.return_value = {"http_status": 503, "outcome": "FAILED", "status": "HTTP error",
+                                          "error": "model_not_loaded: No owned machine serves this model"}
+                state, output = self.tick(10180)
+                self.assertIn("production token unavailable" if missing else "error=model_not_loaded", output)
+                self.assertNotIn("switch_probe", state)
+                self.assertEqual(state["probes"], original["probes"])
+                self.manager = Manager(self.args)
+                self.tick(10181)
+                self.assertEqual(self.send.call_count, 0 if missing else 1)
+
+    def test_extra_probe_appears_in_next_two_and_regular_probe_can_run_first(self):
+        state = self.queue_switch_probe(10100)
+        lines = probe_schedule_lines(state, 10000, True, True)
+        self.assertIn("Probe 1:   production at", lines[0])
+        self.assertIn("Probe 2:   production (after switch)", lines[1])
+        self.assertIn("in 3m", lines[1])
+        self.tick(10100)
+        self.tick(10179)
+        self.send.assert_called_once()
+        state, _ = self.tick(10180)
+        self.assertEqual(self.send.call_count, 2)
+        self.assertEqual(state["probes"]["next_at"], 11900)
+        self.assertEqual(state["probes"]["next_kind"], "local")
+        self.assertEqual(state["probes"]["last_result"]["at"], 10100)
+
+    def test_switch_probe_write_failure_prevents_post(self):
+        self.queue_switch_probe()
+        with patch("warm_model_manager.write_json_atomic", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.tick(10180)
+        self.send.assert_not_called()
 
     def test_token_setup_is_private_and_does_not_start_manager(self):
         self.token.chmod(0o644)
@@ -1509,6 +1670,64 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["last_score_snapshot"]["models"]["good"]["score"],
                          state["last_score_snapshot"]["models"]["good"]["score"])
         self.launch.assert_not_called()
+
+    def test_switch_probe_starts_at_confirmed_warmup_and_survives_checks_and_restart(self):
+        self.args.hourly_probes = True
+        state, _ = self.tick()
+        self.assertNotIn("switch_probe", state)  # Already warm at startup.
+        state["probes"] = {"next_kind": "production", "next_at": 11800}
+        state["pending_switch"] = {"target": "good", "warm_models": ["good"], "command_at": 10000}
+        self.save(state)
+        warm = self.daemon.return_value
+        self.daemon.return_value = replace(warm, warm_models=())
+        waiting, _ = self.tick(10060)
+        self.assertNotIn("switch_probe", waiting)
+        self.daemon.return_value = warm
+        self.manager.next_probe_at = 11800
+        confirmed, report = self.tick(10120)
+        self.assertEqual(confirmed["switch_probe"]["due_at"], 10300)
+        self.assertEqual(confirmed["switch_probe"]["target"], "good")
+        self.assertEqual(self.manager.next_probe_at, 0)
+        self.assertIn("Probe 1:   production (after switch)", report)
+        self.assertIn("Probe 2:   production at", report)
+        self.manager = Manager(self.args)
+        after, _ = self.tick(10180)
+        self.assertEqual(after["switch_probe"], confirmed["switch_probe"])
+        self.assertEqual(after["probes"], state["probes"])
+        with patch("warm_model_manager.probe_credentials", return_value=(PROD_PROBE_URL, "fixture")), \
+                patch("warm_model_manager.send_probe", return_value={"http_status": 200, "outcome": "SUCCESS"}), \
+                redirect_stdout(io.StringIO()):
+            self.clock.return_value = 10300
+            self.manager.probe_if_due()
+        after, _ = self.tick(10360)
+        self.assertNotIn("switch_probe", after)
+        self.assertEqual(after["last_switch_probe_result"]["outcome"], "SUCCESS")
+        self.launch.assert_not_called()
+
+    def test_switch_probe_is_not_queued_when_disabled_or_dry(self):
+        state, _ = self.tick()
+        state["pending_switch"] = {"target": "good", "warm_models": ["good"], "command_at": 10000}
+        for enabled, apply in ((False, True), (True, False)):
+            self.args.hourly_probes, self.args.apply = enabled, apply
+            self.save(state)
+            after, _ = self.tick(10060)
+            self.assertNotIn("switch_probe", after)
+        self.launch.assert_not_called()
+
+    def test_switch_enables_local_endpoint_only_with_probes_and_cancels_previous_extra(self):
+        state, _ = self.tick()
+        self.daemon.return_value = replace(self.daemon.return_value, warm_models=())
+        state["switch_probe"] = {"target": "previous", "pid": 123, "due_at": 10180}
+        for enabled in (False, True):
+            self.args.hourly_probes = enabled
+            self.save(state)
+            self.launch.reset_mock()
+            with patch("warm_model_manager.local_endpoint_start_flags", return_value=["--local-endpoint"]) as flags:
+                after, _ = self.tick(10060)
+            self.assertNotIn("switch_probe", after)
+            self.assertEqual(after["pending_switch"]["target"], "good")
+            self.assertEqual(self.launch.call_args.kwargs, {"local_flags": ["--local-endpoint"]} if enabled else {})
+            self.assertEqual(flags.call_count, int(enabled))
 
     def test_once_sends_one_due_probe_after_confirming_current_model(self):
         self.args.hourly_probes = True
