@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.9 — 2026-09-16
+
+- Add optional `--recover-routing` for continuous live runs. Observe a model
+  warm for 15 minutes, then require three local successes paired with production
+  self-route `503 model_not_loaded` responses, five minutes apart.
+- Pause switching and other probes while confirming the failure. Cancel the
+  shutdown if this provider receives network requests. Ignore timeouts, key
+  errors, rate limits and ordinary idle periods as recovery triggers.
+- Verify the matching launchd process, stop once, and wait 15 minutes from
+  confirmed shutdown before starting the same model. Preserve config selection,
+  local endpoint settings, ignore exclusions and single-model preloads.
+- Persist the recovery stage, offline deadline and command intents. Resume
+  across manager restarts without repeating commands or shortening the wait.
+  Refuse changed paths/config, excluded models and conflicting external starts.
+- Check routing after warm-up and confirm recovery only through this provider's
+  network request counter. An account-wide self-route success alone is not proof.
+  Keep the one-attempt guard until local network traffic returns or the operator
+  uses `reset-recovery`; do not retry failed recovery in a shutdown loop.
+- Show recovery stages, restart countdowns and redacted probe results. Document
+  setup, saved state, Ctrl-C behavior and the limits of this experimental workaround.
+- Add offline recovery, interruption, exclusion and process-identity tests.
+  No live provider was stopped, started or probed during development.
+
 ## 0.1.8 — 2026-09-16
 
 - With `--hourly-probes`, send one extra production self-route prompt three

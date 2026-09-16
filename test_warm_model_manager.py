@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+import warm_model_manager as manager_module
 from pathlib import Path
 from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
@@ -66,6 +68,9 @@ from warm_model_manager import (
 
 
 MODELS = ["q35", "q36", "gemma", "gpt"]
+ORIGINAL_STOP_PROVIDER = manager_module.stop_provider
+ORIGINAL_PROVIDER_SERVICES = manager_module.provider_services
+ORIGINAL_SEND_PROBE = manager_module.send_probe
 
 
 def setUpModule() -> None:
@@ -79,7 +84,7 @@ def setUpModule() -> None:
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.8")
+        self.assertEqual(MANAGER_VERSION, "0.1.9")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -1610,6 +1615,490 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("error=invalid_api_key: key is invalid", report)
         self.assertIn("Probe 1:   production", report)
         self.assertEqual(state["probes"]["next_at"], 11800)
+
+
+class RoutingRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.directory = Path(temp.name)
+        self.path = self.directory / "state.json"
+        self.config = self.directory / "provider.toml"
+        self.config.write_text('[backend]\npreload_models = ["good"]\n')
+        self.local = self.directory / "local.json"
+        self.local.write_text(json.dumps({"pid": 123, "base_url": "http://127.0.0.1:8000/v1",
+                                         "api_key": "fixture-local-token"}))
+        self.token = self.directory / "token"
+        self.token.write_text("fixture-production-token")
+        self.token.chmod(0o600)
+        self.args = build_parser().parse_args([
+            "run", "--apply", "--recover-routing", "--hourly-probes",
+            "--state", str(self.path), "--config", str(self.config),
+            "--daemon-state", str(self.directory / "daemon.json"),
+            "--local-endpoint-file", str(self.local), "--prod-token-file", str(self.token),
+        ])
+        self.manager = Manager(self.args)
+        self.now = self.mock("time.time", return_value=10000)
+        self.monotonic = self.mock("time.monotonic", side_effect=lambda: self.now.return_value)
+        self.warm = LocalDaemonState("good", ("good",), False, 123, 100, True,
+                                     requests_served=0, reconnect_count=1)
+        self.daemon = self.mock("read_daemon_state", return_value=self.warm)
+        self.services = self.mock("provider_services", return_value={"io.darkbloom.provider": 123})
+        self.alive = self.mock("process_alive", return_value=True)
+        self.stop = self.mock("stop_provider")
+        self.launch = self.mock("switch_model")
+        self.discovery = self.mock("local_model_ids", return_value={"good"})
+        self.send = self.mock("send_probe", side_effect=lambda kind, *args: self.ok() if kind == "local" else self.failure())
+
+    def mock(self, name, **kwargs):
+        p = patch("warm_model_manager." + name, **kwargs)
+        result = p.start()
+        self.addCleanup(p.stop)
+        return result
+
+    @staticmethod
+    def ok():
+        return {"outcome": "SUCCESS", "http_status": 200, "status": "completion received",
+                "provider_id": "another-provider"}
+
+    @staticmethod
+    def failure():
+        return {"outcome": "FAILED", "http_status": 503, "error_code": "model_not_loaded",
+                "status": "HTTP error", "error": "model_not_loaded: not available"}
+
+    def tick(self, at):
+        self.now.return_value = at
+        with redirect_stdout(io.StringIO()) as output:
+            self.manager.recovery_if_due()
+        state = json.loads(self.path.read_text()) if self.path.exists() else {}
+        return state.get("routing_recovery", {}), output.getvalue()
+
+    def trigger(self):
+        self.tick(10000)
+        self.tick(10900)
+        self.tick(11200)
+        return self.tick(11500)
+
+    def stopped(self):
+        self.trigger()
+        self.daemon.return_value = None
+        self.services.return_value = {}
+        self.alive.return_value = False
+        return self.tick(11515)
+
+    def restart(self):
+        self.stopped()
+        self.tick(12415)
+        self.warm = replace(self.warm, pid=124, started_at=12415)
+        self.daemon.return_value = self.warm
+        self.local.write_text(json.dumps({"pid": 124, "base_url": "http://127.0.0.1:8000/v1", "api_key": "fixture-local-token"}))
+        return self.tick(12430)
+
+    def test_requires_opt_in_live_continuous_run(self):
+        self.assertFalse(build_parser().parse_args([]).recover_routing)
+        for setting, value in (("apply", False), ("recover_routing", False), ("mode", "once")):
+            original = getattr(self.args, setting)
+            setattr(self.args, setting, value)
+            self.manager = Manager(self.args)
+            self.tick(10000)
+            setattr(self.args, setting, original)
+        self.assertFalse(self.path.exists())
+        self.send.assert_not_called()
+        self.stop.assert_not_called()
+        with patch.object(sys, "argv", ["manager", "once", "--apply", "--recover-routing"]):
+            with self.assertRaisesRegex(SystemExit, "requires run"):
+                main()
+
+    def test_observes_full_warm_grace_then_three_spaced_failures(self):
+        self.tick(10000)
+        self.tick(10899)
+        self.send.assert_not_called()
+        first, output = self.tick(10914)
+        self.assertEqual(first["failures"], 1)
+        self.assertIn("local probe: SUCCESS", output)
+        self.assertIn("production probe: FAILED", output)
+        self.assertIn("HTTP 503", output)
+        self.tick(11213)
+        self.assertEqual(self.send.call_count, 2)
+        self.manager = Manager(self.args)
+        self.tick(11214)
+        self.stop.assert_not_called()
+        recovery, _ = self.tick(11514)
+        self.assertEqual(recovery["phase"], "stopping")
+        self.stop.assert_called_once_with("darkbloom", 123)
+        self.assertEqual(self.send.call_count, 6)
+        self.assertNotIn("fixture-", self.path.read_text())
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_confirmed_stop_starts_full_countdown_and_resume_preserves_it(self):
+        recovery, _ = self.stopped()
+        self.assertEqual(recovery["restart_at"], 12415)
+        self.manager = Manager(self.args)
+        self.tick(12414)
+        self.launch.assert_not_called()
+        self.tick(12429)
+        self.launch.assert_called_once()
+        self.assertEqual(self.launch.call_args.args, ("darkbloom", "good", self.config, set()))
+        self.assertIn("--local-endpoint", self.launch.call_args.kwargs["local_flags"])
+        self.assertEqual(self.config.read_text(), '[backend]\npreload_models = ["good"]\n')
+
+    def test_clock_jump_cannot_shorten_offline_wait(self):
+        self.stopped()
+        self.monotonic.side_effect = None
+        self.monotonic.return_value = 11600
+        self.tick(20000)
+        self.launch.assert_not_called()
+        self.manager = Manager(self.args)
+        self.monotonic.return_value = 500
+        recovery, _ = self.tick(20015)
+        self.assertEqual(recovery["restart_at"], 20915)
+        self.launch.assert_not_called()
+
+    def test_offline_timer_begins_after_slow_stop_verification(self):
+        self.trigger()
+        self.daemon.return_value = None
+        self.alive.return_value = False
+        def service_check():
+            self.now.return_value += 20
+            return {}
+        self.services.side_effect = service_check
+        recovery, _ = self.tick(11515)
+        self.assertEqual(recovery["restart_at"], 12435)
+        self.assertEqual(recovery["stopped_monotonic"], 11535)
+
+    def test_warmup_restarts_minimum_warm_time_and_other_provider_success_is_unconfirmed(self):
+        recovery, _ = self.restart()
+        self.assertEqual(recovery["phase"], "verifying")
+        state = json.loads(self.path.read_text())
+        self.assertEqual(state["last_switch_at"], 12430)
+        self.assertNotIn("pending_switch", state)
+        self.send.side_effect = lambda *args: self.ok()
+        recovery, output = self.tick(12610)
+        self.assertEqual(recovery["phase"], "verifying")
+        self.assertIn("this provider remains unconfirmed", output)
+        recovery, _ = self.tick(13330)
+        self.assertEqual(recovery["phase"], "locked")
+        self.assertTrue(recovery["attempted"])
+        self.manager = Manager(self.args)
+        self.tick(20000)
+        self.stop.assert_called_once()
+        self.launch.assert_called_once()
+
+    def test_only_local_network_counter_confirms_and_rearms(self):
+        self.restart()
+        self.daemon.return_value = replace(self.warm, requests_served=1)
+        recovery, output = self.tick(12445)
+        self.assertEqual(recovery["phase"], "monitoring")
+        self.assertFalse(recovery["attempted"])
+        self.assertIn("network requests reached this provider", output)
+
+    def test_requests_arriving_during_failure_checks_cancel_recovery(self):
+        self.tick(10000)
+        self.tick(10900)
+        self.daemon.return_value = replace(self.warm, requests_served=1)
+        recovery, _ = self.tick(10915)
+        self.assertEqual(recovery["phase"], "monitoring")
+        self.assertEqual(recovery["failures"], 0)
+        self.stop.assert_not_called()
+
+    def test_requests_or_busy_state_after_probe_or_discovery_prevent_stop(self):
+        for when in ("local", "production", "discovery"):
+            for traffic in (False, True):
+                with self.subTest(when=when, traffic=traffic):
+                    self.path.unlink(missing_ok=True)
+                    self.manager = Manager(self.args)
+                    self.daemon.return_value = self.warm
+                    self.send.side_effect = lambda kind, *a: self.ok() if kind == "local" else self.failure()
+                    self.discovery.side_effect = None
+                    self.tick(10000)
+                    self.tick(10900)
+                    self.tick(11200)
+                    def change(*args):
+                        self.daemon.return_value = replace(self.warm, requests_served=1) if traffic else replace(self.warm, inference_active=True)
+                        return {"good"}
+                    if when == "discovery":
+                        self.discovery.side_effect = change
+                    else:
+                        def reply(kind, *args):
+                            if kind == when:
+                                change()
+                            return self.ok() if kind == "local" else self.failure()
+                        self.send.side_effect = reply
+                    self.tick(11500)
+                    self.stop.assert_not_called()
+
+    def test_other_api_failures_never_count_as_routing_failure(self):
+        responses = [self.ok(), {"outcome": "FAILED", "http_status": 503, "error": "model_not_loaded"},
+                     {"outcome": "FAILED", "http_status": None, "error": "timeout"}]
+        responses += [{**self.failure(), "http_status": code} for code in (200, 401, 403, 429, 500)]
+        responses += [{**self.failure(), "error_code": code} for code in ("model_unavailable", "rate_limit_exceeded")]
+        for response in responses:
+            with self.subTest(response=response):
+                self.path.unlink(missing_ok=True)
+                self.manager = Manager(self.args)
+                self.send.side_effect = lambda kind, *a: self.ok() if kind == "local" else response
+                recovery, _ = self.trigger()
+                self.assertEqual(recovery["failures"], 0)
+                self.stop.assert_not_called()
+
+    def test_local_failure_and_missing_token_cannot_trigger_stop(self):
+        self.send.side_effect = lambda *a: self.failure()
+        recovery, _ = self.trigger()
+        self.assertEqual(recovery["failures"], 0)
+        self.assertTrue(all(call.args[0] == "local" for call in self.send.call_args_list))
+        self.send.reset_mock()
+        self.token.unlink()
+        self.tick(11800)
+        self.send.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_process_model_and_reconnect_changes_reset_observation(self):
+        for changed in (replace(self.warm, pid=999), replace(self.warm, started_at=10905),
+                        replace(self.warm, warm_models=("different",)), replace(self.warm, reconnect_count=2),
+                        replace(self.warm, fresh=False), replace(self.warm, requests_served=None)):
+            with self.subTest(changed=changed):
+                self.path.unlink(missing_ok=True)
+                self.manager = Manager(self.args)
+                self.daemon.return_value = self.warm
+                self.tick(10000)
+                self.tick(10900)
+                self.daemon.return_value = changed
+                recovery, _ = self.tick(10915)
+                self.assertEqual(recovery["failures"], 0)
+                self.assertEqual(recovery["next_check_at"], 11815)
+                self.stop.assert_not_called()
+
+    def test_long_manager_pause_breaks_consecutive_checks(self):
+        self.tick(10000)
+        self.tick(10900)
+        self.manager = Manager(self.args)
+        recovery, _ = self.tick(15000)
+        self.assertEqual(recovery["failures"], 1)
+        self.stop.assert_not_called()
+
+    def test_ignore_or_exclusion_prevents_checks_and_restart(self):
+        for change in (lambda: self.manager.ignored.add("good"), lambda: setattr(self.args, "model", ["other"])):
+            self.path.unlink(missing_ok=True)
+            self.args.model = None
+            self.manager = Manager(self.args)
+            self.daemon.return_value = self.warm
+            self.services.return_value = {"io.darkbloom.provider": 123}
+            self.alive.return_value = True
+            self.stopped()
+            change()
+            recovery, _ = self.tick(12415)
+            self.assertEqual(recovery["phase"], "locked")
+            self.launch.assert_not_called()
+        self.path.unlink()
+        self.manager = Manager(self.args)
+        self.daemon.return_value = self.warm
+        self.send.reset_mock()
+        self.trigger()
+        self.send.assert_not_called()
+
+    def test_removed_model_or_changed_config_cancels_restart(self):
+        for change in (lambda: self.config.write_text('[backend]\npreload_models = ["other"]\n'),
+                       lambda: setattr(self.discovery, "return_value", set())):
+            self.path.unlink(missing_ok=True)
+            self.config.write_text('[backend]\npreload_models = ["good"]\n')
+            self.discovery.return_value = {"good"}
+            self.manager = Manager(self.args)
+            self.daemon.return_value = self.warm
+            self.services.return_value = {"io.darkbloom.provider": 123}
+            self.alive.return_value = True
+            self.stopped()
+            change()
+            recovery, _ = self.tick(12415)
+            self.assertEqual(recovery["phase"], "locked")
+            self.launch.assert_not_called()
+
+    def test_stop_and_start_interruptions_are_not_replayed(self):
+        self.stop.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.trigger()
+        self.manager = Manager(self.args)
+        recovery, _ = self.tick(11560)
+        self.assertEqual(recovery["phase"], "locked")
+        self.stop.assert_called_once()
+        self.path.unlink()
+        self.stop.side_effect = None
+        self.manager = Manager(self.args)
+        self.stopped()
+        self.launch.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(12415)
+        self.manager = Manager(self.args)
+        self.tick(12430)
+        recovery, _ = self.tick(12600)
+        self.assertEqual(recovery["phase"], "locked")
+        self.launch.assert_called_once()
+        self.assertIn("pending_switch", json.loads(self.path.read_text()))
+
+    def test_timed_out_stop_can_still_be_confirmed_without_retry(self):
+        self.stop.side_effect = subprocess.TimeoutExpired("darkbloom", 60)
+        recovery, _ = self.stopped()
+        self.assertEqual(recovery["phase"], "offline")
+        self.stop.assert_called_once()
+
+    def test_write_failure_prevents_stop_or_start(self):
+        original = manager_module.write_json_atomic
+        def write(path, state):
+            if state.get("routing_recovery", {}).get("phase") in {"stopping", "starting"}:
+                raise OSError("disk full")
+            original(path, state)
+        with patch("warm_model_manager.write_json_atomic", side_effect=write):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.trigger()
+        self.stop.assert_not_called()
+        self.path.unlink()
+        self.manager = Manager(self.args)
+        self.stopped()
+        with patch("warm_model_manager.write_json_atomic", side_effect=write):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.tick(12415)
+        self.launch.assert_not_called()
+
+    def test_pause_survives_disabled_flag_dry_run_and_manager_restart(self):
+        self.stopped()
+        state_before = self.path.read_text()
+        self.args.recover_routing = False
+        self.manager = Manager(self.args)
+        with redirect_stdout(io.StringIO()) as output:
+            self.manager.iteration()
+            self.manager.probe_if_due()
+        self.assertIn("saved recovery is paused", output.getvalue())
+        self.assertEqual(self.path.read_text(), state_before)
+        self.args.recover_routing = True
+        self.args.apply = False
+        self.tick(13000)
+        self.launch.assert_not_called()
+        self.assertEqual(self.path.read_text(), state_before)
+
+    def test_external_start_aborts_offline_recovery(self):
+        self.stopped()
+        self.daemon.return_value = replace(self.warm, pid=999)
+        recovery, _ = self.tick(11800)
+        self.assertEqual(recovery["phase"], "locked")
+        self.stop.assert_called_once()
+        self.launch.assert_not_called()
+
+    def test_changed_paths_and_corrupt_state_fail_closed(self):
+        self.stopped()
+        self.args.config = self.directory / "other.toml"
+        self.manager = Manager(self.args)
+        with self.assertRaisesRegex(ValueError, "paths changed"):
+            self.tick(12415)
+        for value in ("not-json", '{"routing_recovery": "bad"}',
+                      '{"routing_recovery":{"schema":1,"phase":"offline","attempted":true,"restart_at":"bad"}}'):
+            self.path.write_text(value)
+            self.manager = Manager(self.args)
+            with self.assertRaises(ValueError):
+                self.tick(13000)
+        self.launch.assert_not_called()
+
+    def test_explicit_reset_preserves_other_state_and_refuses_active_wait(self):
+        self.stopped()
+        self.args.mode = "reset-recovery"
+        with self.assertRaisesRegex(ValueError, "active recovery"):
+            self.manager.run()
+        state = json.loads(self.path.read_text())
+        state["routing_recovery"]["phase"] = "locked"
+        state["pressure_history"] = {"good": [{"at": 10000, "pressure": 1}]}
+        self.path.write_text(json.dumps(state))
+        with redirect_stdout(io.StringIO()):
+            self.manager.run()
+        remaining = json.loads(self.path.read_text())
+        self.assertNotIn("routing_recovery", remaining)
+        self.assertEqual(remaining["pressure_history"], state["pressure_history"])
+        self.launch.assert_not_called()
+
+    def test_daemon_reader_accepts_only_real_network_counters(self):
+        with patch("warm_model_manager.read_json", return_value={
+                "pid": 123, "written_at": 10000, "stats": {"requests_served": 12},
+                "connectivity": {"reconnect_count": 3}}):
+            daemon = read_daemon_state(self.args.daemon_state, now=10000)
+        self.assertEqual(daemon.requests_served, 12)
+        self.assertEqual(daemon.reconnect_count, 3)
+        for value in (None, -1, True, "12", 1.5):
+            self.assertIsNone(manager_module.nonnegative_int(value))
+
+    def test_stop_helper_only_targets_matching_launchd_pid(self):
+        # Call the actual implementation while keeping all OS commands mocked.
+        with patch("warm_model_manager.provider_services", return_value={"io.darkbloom.provider": 123}), \
+                patch("warm_model_manager.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            ORIGINAL_STOP_PROVIDER("/custom/darkbloom", 123)
+            self.assertEqual(run.call_args.args[0], ["/custom/darkbloom", "stop"])
+        for services in ({}, {"io.darkbloom.provider": 999},
+                         {"io.darkbloom.provider": 123, "dev.darkbloom.provider": 456}):
+            with patch("warm_model_manager.provider_services", return_value=services), \
+                    patch("warm_model_manager.subprocess.run") as run:
+                with self.assertRaisesRegex(RuntimeError, "match"):
+                    ORIGINAL_STOP_PROVIDER("darkbloom", 123)
+                run.assert_not_called()
+
+    def test_service_lookup_distinguishes_absent_unknown_and_multiple_services(self):
+        absent = subprocess.CompletedProcess([], 113, "", "Could not find service in domain")
+        loaded = subprocess.CompletedProcess([], 0, "service = {\n    pid = 123\n}\n", "")
+        with patch("warm_model_manager.subprocess.run", side_effect=[loaded, absent]) as run:
+            self.assertEqual(ORIGINAL_PROVIDER_SERVICES(), {"io.darkbloom.provider": 123})
+            self.assertEqual(run.call_args_list[0].args[0][:2], ["/bin/launchctl", "print"])
+        with patch("warm_model_manager.subprocess.run", return_value=absent):
+            self.assertEqual(ORIGINAL_PROVIDER_SERVICES(), {})
+        with patch("warm_model_manager.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "", "permission denied")):
+            with self.assertRaisesRegex(RuntimeError, "cannot verify"):
+                ORIGINAL_PROVIDER_SERVICES()
+
+    def test_real_http_error_parser_preserves_only_structured_failure_code(self):
+        with patch("warm_model_manager.build_opener") as build:
+            build.return_value.open.side_effect = HTTPError(
+                PROD_PROBE_URL, 503, "Unavailable", {},
+                io.BytesIO(b'{"error":{"code":"model_not_loaded","message":"not available"}}'))
+            result = ORIGINAL_SEND_PROBE("production", "good", PROD_PROBE_URL, "fixture-secret")
+        self.assertEqual(result["error_code"], "model_not_loaded")
+        self.assertEqual(result["http_status"], 503)
+        self.assertEqual(result["outcome"], "FAILED")
+        result = probe_response_details(b'{"error":{"code":"secret","message":"secret"}}', "secret", 503)
+        self.assertNotIn("secret", json.dumps(result))
+
+    def test_recovery_checks_run_between_long_score_intervals(self):
+        self.args.check_every = 3600
+        times = []
+        def recover():
+            times.append(self.now.return_value)
+            if len(times) == 3:
+                self.manager.stop(None, None)
+        def advance(seconds):
+            self.now.return_value += seconds
+        with patch.object(self.manager, "iteration") as iteration, \
+                patch.object(self.manager, "recovery_if_due", side_effect=recover), \
+                patch.object(self.manager, "probe_if_due"), \
+                patch("warm_model_manager.time.sleep", side_effect=advance), redirect_stdout(io.StringIO()):
+            self.manager.run()
+        iteration.assert_called_once()
+        self.assertLess(times[-1] - times[0], self.args.check_every)
+
+    def test_active_recovery_cannot_be_bypassed_by_normal_iteration(self):
+        self.stopped()
+        state = json.loads(self.path.read_text())
+        with patch("warm_model_manager.fetch_capacity") as capacity, redirect_stdout(io.StringIO()) as output:
+            self.manager.iteration()
+            self.manager.probe_if_due()
+        capacity.assert_not_called()
+        self.launch.assert_not_called()
+        self.assertIn("15m remaining", output.getvalue())
+        self.assertEqual(json.loads(self.path.read_text()), state)
+
+    def test_post_start_timeout_is_not_retried_but_warm_state_can_confirm(self):
+        self.stopped()
+        self.launch.side_effect = subprocess.TimeoutExpired("darkbloom", 300)
+        self.tick(12415)
+        self.daemon.return_value = replace(self.warm, pid=124, started_at=12415, requests_served=1)
+        self.manager = Manager(self.args)
+        recovery, _ = self.tick(12430)
+        self.assertFalse(recovery["attempted"])
+        self.assertEqual(recovery["phase"], "monitoring")
+        self.assertNotIn("pending_switch", json.loads(self.path.read_text()))
+        self.launch.assert_called_once()
 
 
 class ManagerIntegrationTests(unittest.TestCase):

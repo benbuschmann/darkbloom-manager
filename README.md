@@ -13,6 +13,7 @@ Discovery: live (local scan; refreshed every check)
 Catalog:   live; 7 models; fetched 10:00 AM PDT
 Prices:    cached; fetched 9:55 AM PDT
 Probes:    OFF (enable with --hourly-probes)
+Recovery:  OFF (enable with --recover-routing)
 Current:   qwen3.5-35b-a3b warm for 1 hour (since 9:00 AM PDT)
 
 MODEL ID                            NOW  AVG 15m   N   IN$/M  OUT$/M BLEND$/M WEIGHT   SCORE STATUS
@@ -34,7 +35,7 @@ Switch rule: at least 25% score improvement after switch cost (--switch-improvem
 Reason:    no allowed model scores higher after switch cost (current 0.0803225)
 ```
 
-[Install](#install) · [Run](#run) · [Read the report](#read-the-report) · [FAQ](#faq)
+[Install](#install) · [Run](#run) · [Routing recovery](#routing-recovery) · [Read the report](#read-the-report) · [FAQ](#faq)
 
 ## Install
 
@@ -82,7 +83,7 @@ Add `--hide-ignored` to hide ignored and auto-ignored models from the table
 and its ranking. Without it, all models remain visible as before.
 
 Without `--apply`, the manager prints decisions and saves its own state. It
-does not launch a model, edit startup preloads, or send probe prompts. It still reads the catalog
+does not launch or stop a provider, edit startup preloads, or send probe prompts. It still reads the catalog
 and local model list through Darkbloom, which may migrate an older provider config.
 
 Add `--config /path/to/provider.toml` if your provider uses a custom config.
@@ -216,8 +217,102 @@ Darkbloom endpoint record. Its default is `~/.darkbloom/local.json`, or
 `--config`, also select the matching `--daemon-state` and endpoint record.
 
 These probes test inference. We have not established that they restore network
-assignments or increase earnings. Turning off `--hourly-probes` stops requests;
-the saved schedule remains for the next time you enable it.
+assignments or increase earnings. Turning off `--hourly-probes` stops those
+scheduled requests; the saved schedule remains for the next time you enable it.
+Checks from `--recover-routing` continue if that separate option is enabled.
+
+## Routing recovery
+
+`--recover-routing` enables one recovery attempt when a warm model answers
+locally but production self-routing repeatedly says it is not loaded. It is
+off by default. Use `run --apply`; `once` cannot finish the shutdown wait.
+
+Save a production token with `set-prod-token` and use a running provider with
+its local endpoint enabled, as described under [hourly probes](#hourly-probes).
+The token must belong to the account that owns the provider. Recovery works
+with or without `--hourly-probes`:
+
+```sh
+python3 warm_model_manager.py run --apply --hourly-probes --recover-routing \
+  --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
+```
+
+The sequence is fixed:
+
+1. Observe the same warm model and provider process for 15 minutes. A model
+   change, process change, reported reconnect, or stale state resets that wait.
+2. While idle, check local inference and then production self-routing every
+   five minutes. Require three consecutive local successes paired with
+   **HTTP 503 and error code `model_not_loaded`**. This takes at least ten
+   minutes after the first failing check. Zero jobs alone, authentication
+   failures, rate limits, timeouts and other server errors do not qualify.
+3. After the first qualifying failure, pause score-based switching and the
+   regular/after-switch probes while completing the checks. New network
+   requests on this provider cancel the shutdown. A failed local check or
+   different production result clears the failure count.
+4. Once all three checks pass, confirm the provider is idle and its process
+   matches Darkbloom's launchd service. Issue `darkbloom stop` once. Wait until
+   both the process and service are gone, then count **15 full minutes offline**.
+5. Start the same model using the same config and saved local endpoint settings.
+   Recheck its local availability and ignore rules first. A changed config,
+   removed/excluded model, or external provider start cancels the saved restart.
+6. Confirm warm-up, restart the minimum warm-time clock, and run a local/self-route
+   check three minutes later. Repeat those checks five minutes apart for up to
+   15 minutes after warm-up. If this provider receives network requests, recovery
+   is confirmed. Otherwise leave it running and report recovery as unconfirmed.
+
+Recovery has its own checks; it does not move the hourly probe schedule. During
+the shutdown, start and verification stages, model switching and other probes
+remain paused. Overdue hourly probes resume through their usual one-at-a-time
+schedule afterward. Outside recovery, score-based switching keeps its normal rules.
+
+Self-route may reach another provider on your account. A successful HTTP response
+alone does not confirm recovery on this Mac. The manager logs the returned provider
+ID when supplied and uses an increase in this process's network `requests_served`
+counter to confirm local recovery. Local endpoint prompts do not increment that
+counter. A successful self-route test reaching this Mac does count; this proves
+reachability, not that paid assignments or earnings have resumed. A missing
+network counter disables automatic recovery.
+
+There is **one shutdown attempt until this provider receives network traffic or
+you explicitly reset recovery**. A manager restart, another model selection, or
+an HTTP success from another Mac does not reset that guard. Failed or interrupted
+stop/start commands are not retried. The manager checks observed process and
+warm-up state because a timed-out command might still have succeeded.
+
+The terminal shows the stage, errors and restart time:
+
+```text
+Recovery:  OFFLINE; provider stopped; waiting 15 minutes before starting the same model
+Restart:   nvidia-nemotron-3.5-lightning at 2026-09-16 10:45:00 PDT; 12m remaining (after confirmed stop)
+Model switching and regular probes paused until recovery finishes.
+```
+
+Keep the manager running through the wait. **Ctrl-C during recovery can leave
+Darkbloom stopped.** Resume the same command, paths and state file to finish the
+saved countdown. Removing `--recover-routing` or `--apply` pauses a saved recovery;
+it does not start the provider early. An unreadable recovery state blocks changes.
+
+To clear a completed attempt or cancel checks, stop the manager and run:
+
+```sh
+python3 warm_model_manager.py reset-recovery
+```
+
+Use the same `--state` path if you changed it. This clears only recovery state and
+issues no provider commands. Reset is refused during shutdown, the offline wait
+or startup; resume the recovery command first. Changing `--config`, `--daemon-state`,
+endpoint/token paths or the CLI path during a saved recovery is also refused.
+Normal recovery restarts respect `--config`. Darkbloom's stop command targets
+the user's launchd service, so the manager refuses to stop a different process
+or a foreground provider.
+
+This is an experimental workaround for the symptoms reported in
+[Darkbloom issue #692](https://github.com/Layr-Labs/d-inference/issues/692).
+A manual 15-minute shutdown restored traffic on two providers, but the issue
+also contains failures after longer gaps. The cause and required waiting time
+are unconfirmed. This release's automated validation uses simulated providers;
+the manager's recovery procedure has not been tested against a live provider.
 
 ## Read the report
 
@@ -443,8 +538,8 @@ and [model scanner](https://github.com/Layr-Labs/d-inference/blob/efcde6334ddf95
 
 ### Do I need a Darkbloom API key?
 
-Scoring and model switching need no API key. The optional
-[hourly probes](#hourly-probes) use Darkbloom's saved local token and a
+Scoring and model switching need no API key. Optional
+[hourly probes](#hourly-probes) and [routing recovery](#routing-recovery) use Darkbloom's saved local token and a
 production API token you save with `set-prod-token`.
 
 The manager reads public capacity and pricing endpoints and uses your installed
@@ -472,13 +567,15 @@ write permissions.
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 | Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's model, outcome, duration, HTTP status, redacted error or skip reason, finish reason, token counts and serving provider ID when available. |
 | Extra probe after a switch | Keep the target, provider process identity, warm-up confirmation and due time until the one-shot request is attempted or skipped. Retain its latest result separately from the hourly probe result. |
+| Optional routing recovery | Stage, model/process identity, one network counter baseline, reconnect count, failure count, next check, stop/start intent, offline deadline, elapsed-time reference, config digest and paths, local endpoint launch flags, latest redacted check results and the one-attempt guard. No config contents or tokens. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
 The state file contains no prompts, generated replies or API keys. Probe errors
 retain only the short, redacted description from the result line. The production
 token lives in its separate private file; the local token stays in Darkbloom's
 endpoint record. Probe logs go to the terminal. The manager does not collect
-local request counts or per-model request rates. Catalog, discovery, and launch errors
+request histories or per-model request rates. With recovery enabled, it retains
+one network request counter baseline to detect traffic on this provider. Catalog, discovery, and launch errors
 can contain local paths or CLI error text.
 
 Use `--state /path/to/state.json` for another location. On the first run with
@@ -492,6 +589,8 @@ in your launch command; saved settings do not replace command-line options.
 
 ### Can I delete the state file?
 
+Do not delete state during routing recovery: it holds the restart deadline and
+the guard against repeated shutdowns. Use `reset-recovery` for a completed attempt.
 Stop the manager first. Deleting state removes rolling samples, progress toward
 the required consecutive checks, and pending warm-up tracking. For a deliberate
 fresh start, use a new `--state` path after stopping the old process. Deleting the default file
@@ -540,6 +639,8 @@ manager before editing pending state.
 It stops the manager after any in-flight check or command finishes. The
 provider keeps its last model, startup preload, and always-warm idle setting.
 The manager runs in the foreground and installs no background service.
+If routing recovery has stopped Darkbloom, Ctrl-C leaves it stopped. Resume the
+same recovery command to finish the saved wait and startup.
 
 ### How do I update an older installation?
 
