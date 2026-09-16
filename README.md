@@ -12,6 +12,7 @@ Darkbloom: RUNNING (pid 4242) | warm: qwen3.5-35b-a3b | idle
 Discovery: live (local scan; refreshed every check)
 Catalog:   live; 7 models; fetched 10:00 AM PDT
 Prices:    cached; fetched 9:55 AM PDT
+Probes:    OFF (enable with --hourly-probes)
 Current:   qwen3.5-35b-a3b warm for 1 hour (since 9:00 AM PDT)
 
 MODEL ID                            NOW  AVG 15m   N   IN$/M  OUT$/M BLEND$/M WEIGHT   SCORE STATUS
@@ -38,8 +39,9 @@ Reason:    no allowed model scores higher after switch cost (current 0.0803225)
 ## Install
 
 You need an Apple Silicon Mac with a configured Darkbloom provider, downloaded
-models, and Python 3.10–3.14. The script uses Python's standard library. It needs
-no API key or extra packages.
+models, and Python 3.10–3.14. The script uses Python's standard library and
+needs no extra packages. Scoring and switching need no API key; optional
+production probes use a token you save separately.
 
 ```sh
 git clone https://github.com/benbuschmann/darkbloom-manager.git
@@ -134,19 +136,46 @@ to the paid fleet. It can choose another Mac that advertises the same model;
 it cannot pin a request to this computer. The local request reaches this Mac.
 See Darkbloom's [self-route documentation](https://github.com/Layr-Labs/d-inference/blob/master/docs/provider/self-route.md).
 
-Logs show the time, endpoint kind, requested model and HTTP result. Production
-logs also show the serving provider ID when the response header includes it:
+Every report shows the next two probe times, with dates, seconds, timezone and
+countdowns. The same two lines appear after each attempt, including skipped
+or failed attempts. For example, at 10:10 AM:
 
 ```text
-2026-09-15 10:00:00-0700 local probe: model="Qwen3.5-9B"; HTTP 200; response received
-2026-09-15 10:30:00-0700 production probe: model="Qwen3.5-9B"; HTTP 200; response received; provider=example-provider
+Probe 1:   production at 2026-09-16 10:30:00 PDT (in 20m)
+Probe 2:   local at 2026-09-16 11:00:00 PDT (in 50m)
 ```
+
+An overdue turn is labeled `overdue`. Its following turn is an estimate until
+the first attempt runs or is skipped. Dry runs show that no prompts are
+scheduled, even if a live schedule exists in the state file.
+
+Probe diagnostics are always printed when `--hourly-probes` is enabled. A
+`SENDING` line identifies the model, endpoint, route, token limit and timeout.
+The result line says `SUCCESS`, `FAILED` or `SKIPPED`:
+
+```text
+2026-09-16 10:00:00-0700 local probe: SENDING; model="Qwen3.5-9B"; POST http://127.0.0.1:8000/v1/chat/completions; max_tokens=64; timeout=30s
+2026-09-16 10:00:02-0700 local probe: SUCCESS; model="Qwen3.5-9B"; HTTP 200; completion received; seconds=2.0; finish_reason=stop; input_tokens=15; output_tokens=1
+2026-09-16 10:30:01-0700 production probe: FAILED; model="Qwen3.5-9B"; HTTP 503; HTTP error; seconds=0.4; error=Service Unavailable; model_not_loaded: No owned machine serves this model
+```
+
+Success requires a JSON completion containing assistant output. An HTTP 200
+with an error or empty output is reported as a failure. Results include elapsed
+seconds, the finish reason, token counts and the serving provider ID when
+available. `finish_reason=length` means generation ran but reached the output
+token limit; it does not mean the model finished its reply.
+
+Failures include the API error code and message, or the connection error.
+Non-JSON HTTP errors show a short excerpt. These details are bounded, reduced
+to one line, and have credentials redacted. Generated replies and full response
+bodies are not printed or saved. Success confirms this inference attempt;
+it does not confirm that network assignments have resumed.
 
 An attempt is skipped if the provider is offline, its state is stale, there
 isn't exactly one warm model, a switch is pending, or it is serving a request.
 Ignored models and models excluded by `--model` are skipped too. Missing tokens
-or an unavailable local endpoint skip that endpoint's turn. Failures are logged
-without response bodies or credentials; there are no immediate retries.
+or an unavailable local endpoint skip that endpoint's turn. There are no
+immediate retries.
 
 The next endpoint and time survive manager restarts. After downtime, the
 manager handles one overdue turn and schedules the other 30 minutes later.
@@ -417,10 +446,11 @@ write permissions.
 | Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
 | Percentage requirement, switch cost, and decision horizon | Reset passing-check counts when the switch rule changes. |
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
-| Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's time, requested model, HTTP status, skip reason and serving provider ID when available. |
+| Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's model, outcome, duration, HTTP status, redacted error or skip reason, finish reason, token counts and serving provider ID when available. |
 
 Each save replaces the latest snapshot and keeps a bounded sample window.
-The state file contains no prompts, response bodies or API keys. The production
+The state file contains no prompts, generated replies or API keys. Probe errors
+retain only the short, redacted description from the result line. The production
 token lives in its separate private file; the local token stays in Darkbloom's
 endpoint record. Probe logs go to the terminal. The manager does not collect
 local request counts or per-model request rates. Catalog, discovery, and launch errors

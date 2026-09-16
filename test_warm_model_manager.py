@@ -47,6 +47,9 @@ from warm_model_manager import (
     migrate_default_state,
     pressure_samples,
     probe_credentials,
+    probe_debug_text,
+    probe_response_details,
+    probe_schedule_lines,
     read_daemon_state,
     reconcile_pending_switch,
     render_preload_model_config,
@@ -1097,7 +1100,8 @@ class ProbeTests(unittest.TestCase):
         self.warm = LocalDaemonState("good", ("good",), False, 123, 100, True)
         self.clock = self.mock("time.time", return_value=10000)
         self.daemon = self.mock("read_daemon_state", return_value=self.warm)
-        self.send = self.mock("send_probe", return_value={"http_status": 200, "status": "response received"})
+        self.send = self.mock("send_probe", return_value={"http_status": 200, "outcome": "SUCCESS",
+                                                        "status": "completion received", "elapsed_seconds": 0.25})
         self.saved = {"pressure_history": {"good": [{"at": 10000, "pressure": 1}]},
                       "live_challenger_streak": 2, "last_switch_at": 9000}
         self.state.write_text(json.dumps(self.saved))
@@ -1124,6 +1128,11 @@ class ProbeTests(unittest.TestCase):
                          [("local", "good"), ("production", "new"), ("local", "new")])
         self.assertEqual(state["probes"]["next_at"], 15400)
         self.assertIn('model="new"; HTTP 200', report)
+        self.assertIn("local probe: SENDING", report)
+        self.assertIn("local probe: SUCCESS", report)
+        self.assertIn("seconds=0.25", report)
+        self.assertIn("Probe 1:   production", report)
+        self.assertIn("Probe 2:   local", report)
         for key, value in self.saved.items():
             self.assertEqual(state[key], value)
         self.assertNotIn("fixture-", self.state.read_text() + report)
@@ -1174,6 +1183,8 @@ class ProbeTests(unittest.TestCase):
                 self.manager.ignored = set(ignored)
                 state, output = self.tick(10000)
                 self.assertIn(reason, output)
+                self.assertIn("probe: SKIPPED", output)
+                self.assertNotIn("SENDING", output)
                 self.assertEqual(state["probes"]["next_at"], 11800)
                 self.assertIsNone(state["probes"]["last_result"]["http_status"])
         self.send.assert_not_called()
@@ -1291,6 +1302,7 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(headers["authorization"], "Bearer " + token)
                 self.assertEqual(headers.get("x-darkbloom-route"), "self" if kind == "production" else None)
                 self.assertEqual(result.get("provider_id"), "provider-another-mac" if kind == "production" else None)
+                self.assertEqual(result["outcome"], "SUCCESS")
                 self.assertEqual(build.call_args.args[0].proxies, {})
                 self.assertIsInstance(build.call_args.args[1], ProbeRedirectHandler)
                 self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 30)
@@ -1301,10 +1313,13 @@ class ProbeTests(unittest.TestCase):
         with patch("warm_model_manager.build_opener") as build:
             response = build.return_value.open.return_value.__enter__.return_value
             response.status = 200
+            response.headers = {}
             response.read.side_effect = TimeoutError("SECRET")
             result = send_probe("production", "model", PROD_PROBE_URL, "SECRET")
         self.assertEqual(result["http_status"], 200)
         self.assertIn("timed out", result["status"])
+        self.assertEqual(result["outcome"], "FAILED")
+        self.assertIn("TimeoutError", result["error"])
         self.assertNotIn("SECRET", json.dumps(result))
 
     def test_malicious_response_headers_and_oversized_body_are_not_logged(self):
@@ -1326,9 +1341,114 @@ class ProbeTests(unittest.TestCase):
                 build.return_value.open.side_effect = error
                 result = send_probe("production", "model", PROD_PROBE_URL, "SECRET")
                 self.assertEqual(result["http_status"], getattr(error, "code", None))
+                self.assertEqual(result["outcome"], "FAILED")
                 self.assertNotIn("SECRET", json.dumps(result))
                 build.return_value.open.assert_called_once()
         self.assertIsNone(ProbeRedirectHandler().redirect_request(None, None, 302, "", {}, "https://other.invalid"))
+
+    def test_report_schedule_shows_both_endpoints_countdowns_and_overdue_estimate(self):
+        state = {"probes": {"next_kind": "production", "next_at": 11800}}
+        lines = probe_schedule_lines(state, 10000, True, True)
+        self.assertIn("production", lines[0])
+        self.assertIn("in 30m", lines[0])
+        self.assertIn("local", lines[1])
+        self.assertIn("in 60m", lines[1])
+        self.assertRegex(lines[0], r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+        overdue = probe_schedule_lines(state, 12000, True, True)
+        self.assertIn("overdue", overdue[0])
+        self.assertIn("estimated, 30m after production attempt", overdue[1])
+        self.assertEqual(state["probes"]["next_at"], 11800)
+
+    def test_initial_and_disabled_schedules_are_honest(self):
+        initial = probe_schedule_lines({}, 10000, True, True)
+        self.assertIn("local", initial[0])
+        self.assertIn("due now", initial[0])
+        self.assertIn("production", initial[1])
+        for enabled, apply, text in ((False, True, "OFF"), (True, False, "DRY RUN")):
+            with self.subTest(enabled=enabled, apply=apply):
+                lines = probe_schedule_lines(self.saved, 10000, enabled, apply)
+                self.assertEqual(len(lines), 1)
+                self.assertIn(text, lines[0])
+                self.assertNotIn("Probe 1", lines[0])
+
+    def test_api_error_code_and_message_are_available_without_credentials(self):
+        body = json.dumps({"error": {"code": "model_not_loaded",
+                                   "message": "No owned machine serves model good; token=SECRET"}}).encode()
+        for status in (200, 503):
+            with self.subTest(status=status), patch("warm_model_manager.build_opener") as build:
+                if status == 503:
+                    build.return_value.open.side_effect = HTTPError(PROD_PROBE_URL, 503, "Service Unavailable", {}, io.BytesIO(body))
+                else:
+                    response = build.return_value.open.return_value.__enter__.return_value
+                    response.status, response.headers, response.read.return_value = 200, {}, body
+                result = send_probe("production", "good", PROD_PROBE_URL, "SECRET")
+                self.assertEqual(result["outcome"], "FAILED")
+                self.assertEqual(result["http_status"], status)
+                self.assertIn("model_not_loaded", result["error"])
+                self.assertIn("No owned machine serves model good", result["error"])
+                self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_http_success_with_bad_or_empty_completion_is_failed(self):
+        for body in (b"<html>SECRET</html>", b"", b"[]", b"{}", b'{"choices": []}',
+                     b'{"choices": [{"message": {"content": ""}}]}'):
+            with self.subTest(body=body):
+                result = probe_response_details(body, "SECRET", 200)
+                self.assertEqual(result["outcome"], "FAILED")
+                self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_non_json_http_error_gives_a_bounded_redacted_excerpt(self):
+        result = probe_response_details(b"upstream connection refused; Authorization: Bearer SECRET\nretry later", "SECRET", 502)
+        self.assertIn("upstream connection refused", result["error"])
+        self.assertIn("retry later", result["error"])
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertNotIn("\n", result["error"])
+
+    def test_completed_inference_reports_finish_reason_and_usage_without_reply_text(self):
+        body = json.dumps({"choices": [{"finish_reason": "length", "message": {"content": "PRIVATE REASONING"}}],
+                           "usage": {"prompt_tokens": 15, "completion_tokens": 64}}).encode()
+        result = probe_response_details(body, "SECRET", 200)
+        self.assertEqual(result["outcome"], "SUCCESS")
+        self.assertEqual(result["finish_reason"], "length")
+        self.assertEqual(result["completion_tokens"], 64)
+        self.assertEqual(result["prompt_tokens"], 15)
+        self.assertIn("token limit", result["status"])
+        self.assertNotIn("PRIVATE REASONING", json.dumps(result))
+
+    def test_debug_text_redacts_keys_and_prevents_terminal_control_or_multiline_output(self):
+        other_key = "sk-db-" + "f" * 64
+        text = "SECRET\nAuthorization: Bearer OTHER\r\x1b[31m api_key=HIDDEN " + other_key + " x" * 500
+        result = probe_debug_text(text, "SECRET")
+        for hidden in ("SECRET", "OTHER", "HIDDEN", other_key, "\n", "\r", "\x1b"):
+            self.assertNotIn(hidden, result)
+        self.assertLessEqual(len(result), 403)
+
+    def test_result_and_both_times_are_logged_even_if_final_state_save_fails(self):
+        from warm_model_manager import write_json_atomic
+        saves = [0]
+        def save(path, state):
+            saves[0] += 1
+            if saves[0] == 2:
+                raise OSError("disk full")
+            write_json_atomic(path, state)
+        with patch("warm_model_manager.write_json_atomic", side_effect=save), \
+                redirect_stdout(io.StringIO()) as report:
+            with self.assertRaises(OSError):
+                self.manager.probe_if_due()
+        self.assertIn("probe: SUCCESS", report.getvalue())
+        self.assertIn("HTTP 200", report.getvalue())
+        self.assertIn("Probe 1:   production", report.getvalue())
+        self.assertIn("Probe 2:   local", report.getvalue())
+        self.assertEqual(json.loads(self.state.read_text())["probes"]["next_at"], 11800)
+
+    def test_failed_probe_logs_specific_error_and_keeps_the_schedule(self):
+        self.send.return_value = {"outcome": "FAILED", "http_status": 401, "status": "HTTP error",
+                                  "error": "invalid_api_key: key is invalid", "elapsed_seconds": 0.1}
+        state, report = self.tick(10000)
+        self.assertIn("probe: FAILED", report)
+        self.assertIn("HTTP 401", report)
+        self.assertIn("error=invalid_api_key: key is invalid", report)
+        self.assertIn("Probe 1:   production", report)
+        self.assertEqual(state["probes"]["next_at"], 11800)
 
 
 class ManagerIntegrationTests(unittest.TestCase):
@@ -1393,12 +1513,28 @@ class ManagerIntegrationTests(unittest.TestCase):
     def test_once_sends_one_due_probe_after_confirming_current_model(self):
         self.args.hourly_probes = True
         with patch("warm_model_manager.probe_credentials", return_value=("http://127.0.0.1:8000/v1/chat/completions", "fixture")), \
-                patch("warm_model_manager.send_probe", return_value={"http_status": 200, "status": "response received"}) as send, \
+                patch("warm_model_manager.send_probe", return_value={"http_status": 200, "outcome": "SUCCESS", "status": "completion received"}) as send, \
                 redirect_stdout(io.StringIO()):
             self.manager.run()
         send.assert_called_once()
         self.assertEqual(send.call_args.args[:2], ("local", "good"))
         self.assertEqual(json.loads(self.path.read_text())["probes"]["next_at"], 11800)
+        self.launch.assert_not_called()
+
+    def test_every_report_shows_next_two_probes_after_restart_without_sending(self):
+        self.args.hourly_probes = True
+        state, initial = self.tick()
+        self.assertIn("Probe 1:   local", initial)
+        self.assertIn("due now", initial)
+        self.assertIn("Probe 2:   production", initial)
+        state["probes"] = {"next_kind": "production", "next_at": 11800}
+        self.save(state)
+        self.manager = Manager(self.args)
+        for now in (10060, 10120):
+            _, report = self.tick(now)
+            self.assertIn("Probe 1:   production", report)
+            self.assertIn("Probe 2:   local", report)
+            self.assertNotIn("SENDING", report)
         self.launch.assert_not_called()
 
     def test_ignored_leader_has_all_math_persisted_but_is_never_selected(self) -> None:

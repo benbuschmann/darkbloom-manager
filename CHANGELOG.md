@@ -9,9 +9,15 @@
   missed requests. Skip busy, offline, stale, switching or excluded models.
 - Add `set-prod-token` for hidden token entry into a separate owner-only file,
   plus path overrides for that token and Darkbloom's local endpoint record.
-- Log probe times, models, HTTP results and returned provider IDs. Keep tokens
-  and response bodies out of logs and state. Reject redirects and require the
-  local endpoint to match the running provider process at a loopback address.
+- Show the next two probe times and countdowns in every report and after every
+  attempt. Label overdue turns, estimated follow-up times and disabled probes.
+- Print sending and result diagnostics with success/failure/skip status,
+  elapsed time, finish reason, token counts and redacted API or connection errors.
+  Check completion bodies so HTTP 200 alone is not reported as success.
+- Log probe times, models, HTTP results and returned provider IDs. Keep tokens,
+  generated replies and full response bodies out of logs and state. Reject
+  redirects and require the local endpoint to match the running provider
+  process at a loopback address.
 
 ## 0.1.7 — 2026-09-11
 

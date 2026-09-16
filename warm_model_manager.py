@@ -38,7 +38,7 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
@@ -632,7 +632,71 @@ def probe_credentials(kind: str, daemon: LocalDaemonState,
     return info["base_url"].rstrip("/") + "/chat/completions", token
 
 
+def probe_debug_text(value: Any, token: str, limit: int = 400) -> str:
+    """Keep diagnostics short, single-line and free of bearer credentials."""
+    if not isinstance(value, (str, int, float)):
+        return ""
+    text = str(value)
+    if token:
+        for secret in (token, quote(token, safe="")):
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(r"(?i)\b(?:sk-db-|dk-local-|github_pat_|gh[pousr]_)[A-Za-z0-9_+./=-]+",
+                  "[redacted]", text)
+    text = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [redacted]", text)
+    text = re.sub(r'''(?i)\b(?:authorization|api[_ -]?key|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)''',
+                  "credential=[redacted]", text)
+    text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def probe_response_details(body: bytes, token: str, http_status: int) -> dict[str, Any]:
+    failed = {"outcome": "FAILED", "status": "invalid response"}
+    if len(body) > 65536:
+        return {**failed, "status": "response exceeded size limit", "error": "response exceeds 64 KiB"}
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        if not 200 <= http_status < 300:
+            excerpt = probe_debug_text(body.decode("utf-8", errors="replace"), token)
+            return {**failed, "error": "non-JSON error response: " + (excerpt or "empty body")}
+        # A malformed success response can contain generated text. Do not dump it.
+        return {**failed, "error": "expected a JSON chat completion; received non-JSON or empty response"}
+    if not isinstance(payload, dict):
+        return {**failed, "error": "expected a JSON object"}
+    if "error" in payload:
+        error = payload["error"]
+        if isinstance(error, dict):
+            fields = (error.get("code") or error.get("type"), error.get("message"))
+        else:
+            fields = (error,)
+        detail = ": ".join(filter(None, (probe_debug_text(field, token) for field in fields)))
+        return {"outcome": "FAILED", "status": "API error", "error": detail or "server returned an error"}
+    if not 200 <= http_status < 300:
+        return {"outcome": "FAILED", "status": "HTTP error", "error": "server returned no structured error details"}
+    choices = payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message")
+    if not isinstance(message, dict) or not any(
+        isinstance(message.get(key), str) and message[key].strip()
+        for key in ("content", "reasoning", "reasoning_content", "refusal")
+    ):
+        return {**failed, "error": "HTTP succeeded, but no assistant output was returned"}
+    result = {"outcome": "SUCCESS", "status": "completion received"}
+    finish = probe_debug_text(choice.get("finish_reason"), token, 60)
+    if finish:
+        result["finish_reason"] = finish
+    if finish == "length":
+        result["status"] = "completion received; output token limit reached"
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens"):
+            if type(usage.get(key)) is int and usage[key] >= 0:
+                result[key] = usage[key]
+    return result
+
+
 def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
+    started = time.monotonic()
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
@@ -645,28 +709,34 @@ def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
     }).encode("utf-8"), headers=headers, method="POST")
     # In particular, never send a local token through an environment proxy.
     opener = build_opener(ProxyHandler({}), ProbeRedirectHandler())
-    status = None
+    result = {"http_status": None, "outcome": "FAILED"}
     try:
         with opener.open(request, timeout=PROBE_TIMEOUT) as response:
-            status = response.status
-            # Finish the small non-streaming response before closing the socket.
-            # Discard its content; bound the read even if the server misbehaves.
-            oversized = len(response.read(65537)) > 65536
-            result = {"http_status": status,
-                      "status": "response exceeded size limit" if oversized else "response received"}
+            result["http_status"] = response.status
             provider = response.headers.get("X-Provider-Id", "")
             if (kind == "production" and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", provider)
-                    and (not token or token not in provider)):
+                    and probe_debug_text(provider, token) == provider):
                 result["provider_id"] = provider
-            # Bodies may contain generated text or error details; do not store them.
-            return result
+            # Finish the small non-streaming response before closing the socket.
+            # Retain only bounded diagnostics, never generated text or raw bodies.
+            result.update(probe_response_details(response.read(65537), token, response.status))
     except HTTPError as error:
-        code = error.code
-        error.close()
-        return {"http_status": code, "status": "HTTP error"}
-    except (URLError, OSError, ValueError, HTTPException):
-        # Exception messages can echo a credential or URL. Keep only a fixed label.
-        return {"http_status": status, "status": "connection failed or timed out"}
+        result.update(http_status=error.code, status="HTTP error")
+        try:
+            details = probe_response_details(error.read(65537), token, error.code)
+            reason = probe_debug_text(error.reason, token)
+            result["error"] = "; ".join(filter(None, (reason, details.get("error"))))
+        except (OSError, ValueError, HTTPException) as read_error:
+            result["error"] = "could not read error response: " + probe_debug_text(str(read_error), token)
+        finally:
+            error.close()
+    except (URLError, OSError, ValueError, HTTPException) as error:
+        cause = error.reason if isinstance(error, URLError) else error
+        error_type = type(cause).__name__ if isinstance(cause, BaseException) else type(error).__name__
+        result.update(status="connection failed or timed out",
+                      error=probe_debug_text(f"{error_type}: {cause}", token))
+    result["elapsed_seconds"] = round(max(0, time.monotonic() - started), 2)
+    return result
 
 
 def migrate_default_state(state_path: Path) -> bool:
@@ -1133,6 +1203,37 @@ def format_local_time(timestamp: float, now: float) -> str:
     return rendered.lstrip("0").replace(" 0", " ")
 
 
+def next_probe_slot(manager_state: dict[str, Any], now: float) -> tuple[str, float]:
+    schedule = manager_state.get("probes")
+    if (not isinstance(schedule, dict)
+            or schedule.get("next_kind") not in ("local", "production")
+            or not isinstance(schedule.get("next_at"), (float, int))
+            or not math.isfinite(schedule["next_at"])):
+        return "local", now
+    return schedule["next_kind"], max(0, min(schedule["next_at"], now + PROBE_SPACING))
+
+
+def probe_schedule_lines(manager_state: dict[str, Any], now: float,
+                         enabled: bool, apply: bool) -> list[str]:
+    if not enabled:
+        return ["Probes:    OFF (enable with --hourly-probes)"]
+    if not apply:
+        return ["Probes:    DRY RUN; no prompts scheduled (--apply required)"]
+    kind, at = next_probe_slot(manager_state, now)
+    other = "production" if kind == "local" else "local"
+    lines = []
+    for number, endpoint, when in ((1, kind, at), (2, other, max(now, at) + PROBE_SPACING)):
+        stamp = datetime.fromtimestamp(when).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        wait = when - now
+        timing = f"in {format_duration(wait)}" if wait > 0 else "due now; next attempt"
+        if wait < 0:
+            timing = f"overdue by {format_duration(-wait)}; next attempt"
+        if number == 2 and at <= now:
+            timing += f"; estimated, 30m after {kind} attempt"
+        lines.append(f"Probe {number}:   {endpoint} at {stamp} ({timing})")
+    return lines
+
+
 def track_current_residency(
     manager_state: dict[str, Any],
     daemon: LocalDaemonState | None,
@@ -1300,6 +1401,7 @@ def print_report(
     blocked: str | None,
     improvement_percent: float,
     hide_ignored: bool,
+    hourly_probes: bool = False,
 ) -> None:
     timestamp = datetime.fromtimestamp(now).astimezone().strftime(
         "%Y-%m-%d %H:%M:%S %Z"
@@ -1348,6 +1450,8 @@ def print_report(
     fetched_at = pricing.get("fetched_at")
     price_age = f"; fetched {format_local_time(fetched_at, now)}" if fetched_at else ""
     print(f"Prices:    {pricing.get('status', 'unknown')}{price_age}", flush=True)
+    for line in probe_schedule_lines(manager_state, now, hourly_probes, apply):
+        print(line, flush=True)
     if hide_ignored:
         print(
             f"Models:    {len(shown_models)} shown; {len(hidden_ignored)} ignored hidden; "
@@ -1482,22 +1586,14 @@ class Manager:
                          if self.state_path.exists() else {})
         if not isinstance(manager_state, dict):
             raise ValueError("invalid manager state")
-        schedule = manager_state.get("probes")
-        if (not isinstance(schedule, dict)
-                or schedule.get("next_kind") not in ("local", "production")
-                or not isinstance(schedule.get("next_at"), (float, int))
-                or not math.isfinite(schedule["next_at"])):
-            schedule = {"next_kind": "local", "next_at": now}
-        if now < schedule["next_at"]:
-            # A backward wall-clock change must not stall probes indefinitely.
-            self.next_probe_at = min(schedule["next_at"], now + PROBE_SPACING)
-            if self.next_probe_at != schedule["next_at"]:
-                schedule["next_at"] = self.next_probe_at
-                manager_state["probes"] = schedule
+        kind, due_at = next_probe_slot(manager_state, now)
+        if now < due_at:
+            self.next_probe_at = due_at
+            if due_at != manager_state["probes"]["next_at"]:
+                manager_state["probes"]["next_at"] = due_at
                 write_json_atomic(self.state_path, manager_state)
             return
 
-        kind = schedule["next_kind"]
         daemon = read_daemon_state(self.args.daemon_state, now=time.time())
         model = None
         reason = None
@@ -1521,6 +1617,7 @@ class Manager:
             except ValueError as error:
                 reason = str(error)  # Only fixed, credential-free messages above.
         result = {"at": now, "kind": kind, "model": model, "http_status": None,
+                  "outcome": "SKIPPED" if reason else "UNKNOWN",
                   "status": "skipped: " + reason if reason else "request started; result unknown"}
         schedule = {
             "next_kind": "production" if kind == "local" else "local",
@@ -1533,15 +1630,26 @@ class Manager:
         write_json_atomic(self.state_path, manager_state)
         self.next_probe_at = schedule["next_at"]
         if not reason and not self.stop_requested:
+            route = "; route=self" if kind == "production" else ""
+            log(f"{kind} probe: SENDING; model={json.dumps(model)}; POST {url}"
+                f"{route}; max_tokens=64; timeout={PROBE_TIMEOUT}s")
             result.update(send_probe(kind, model, url, token))
-            write_json_atomic(self.state_path, manager_state)
         elif self.stop_requested and not reason:
+            result["outcome"] = "SKIPPED"
             result["status"] = "skipped: manager is stopping"
-            write_json_atomic(self.state_path, manager_state)
         http_result = f"HTTP {result['http_status']}" if result["http_status"] is not None else "HTTP N/A"
-        served_by = f"; provider={result['provider_id']}" if result.get("provider_id") else ""
-        log(f"{kind} probe: model={json.dumps(model)}; {http_result}; {result['status']}{served_by}")
-        log(f"next probe: {schedule['next_kind']} at {format_local_time(self.next_probe_at, now)}")
+        details = [result["status"]]
+        for key, label in (("elapsed_seconds", "seconds"), ("finish_reason", "finish_reason"),
+                           ("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"),
+                           ("provider_id", "provider"), ("error", "error")):
+            if key in result:
+                details.append(f"{label}={result[key]}")
+        log(f"{kind} probe: {result['outcome']}; model={json.dumps(model)}; {http_result}; "
+            + "; ".join(details))
+        for line in probe_schedule_lines(manager_state, time.time(), True, True):
+            log(line)
+        # Show the HTTP result even if saving its diagnostic summary fails.
+        write_json_atomic(self.state_path, manager_state)
 
     def discover_models(self, manager_state: dict[str, Any], now: float) -> set[str]:
         previous = manager_state.get("discovery") or {}
@@ -1787,6 +1895,7 @@ class Manager:
             blocked,
             self.args.switch_improvement_percent,
             self.args.hide_ignored,
+            self.args.hourly_probes,
         )
         selection_matches = warm_selection_matches(
             daemon,
