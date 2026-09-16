@@ -94,7 +94,7 @@ def timeline_lines(state, now, enabled=True, apply=True):
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.12")
+        self.assertEqual(MANAGER_VERSION, "0.1.13")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -646,6 +646,26 @@ class RuntimeForecastTests(unittest.TestCase):
 
 
 class DaemonStateTests(unittest.TestCase):
+    def test_reads_session_counters_without_coercing_missing_or_invalid_values(self):
+        for value in (0, 168, 124521, 2**64 - 1, None, -1, True, "12", 1.5):
+            with self.subTest(value=value), \
+                    patch("warm_model_manager.read_json", return_value={
+                        "pid": 7, "written_at": 995,
+                        "stats": {"requests_served": value, "tokens_generated": value},
+                    }), patch("warm_model_manager.process_alive", return_value=True):
+                daemon = read_daemon_state(Path("unused-daemon.json"), now=1000)
+                expected = value if type(value) is int and value >= 0 else None
+                self.assertEqual(daemon.requests_served, expected)
+                self.assertEqual(daemon.tokens_generated, expected)
+        for stats in ({}, None, []):
+            with self.subTest(stats=stats), \
+                    patch("warm_model_manager.read_json", return_value={
+                        "pid": 7, "written_at": 995, "stats": stats,
+                    }), patch("warm_model_manager.process_alive", return_value=True):
+                daemon = read_daemon_state(Path("unused-daemon.json"), now=1000)
+                self.assertIsNone(daemon.requests_served)
+                self.assertIsNone(daemon.tokens_generated)
+
     def test_reads_daemon_warmth_and_activity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "daemon.json"
@@ -2463,6 +2483,44 @@ class TimelineReportTests(unittest.TestCase):
         self.assertIn("local endpoint", events[4].text)
         self.assertIn("production self-route", events[5].text)
         self.assertEqual(notes, [])
+        self.assertEqual(json.dumps(self.state, sort_keys=True), before)
+
+    def test_session_counts_in_both_views_and_modes(self):
+        daemon = replace(self.daemon, requests_served=168, tokens_generated=124521)
+        for columns in ("ladder", "full"):
+            for apply in (True, False):
+                with self.subTest(columns=columns, apply=apply):
+                    text = self.render(daemon=daemon, columns=columns, apply=apply)
+                    self.assertEqual(text.count("session: 168 requests | 124,521 tokens"), 1)
+                    self.assertLess(text.index("now "), text.index("session:"))
+                    self.assertLess(text.index("session:"), text.index("next "))
+
+    def test_session_counts_show_zero_and_independent_missing_values(self):
+        for requests, tokens, expected in (
+                (0, 0, "session: 0 requests | 0 tokens"),
+                (None, 124521, "session: N/A requests | 124,521 tokens"),
+                (1234, None, "session: 1,234 requests | N/A tokens")):
+            with self.subTest(requests=requests, tokens=tokens):
+                # Counters cover the provider session even when no model is warm.
+                daemon = replace(self.daemon, warm_models=(), current_model=None,
+                                 requests_served=requests, tokens_generated=tokens)
+                self.assertIn(expected, self.render(daemon=daemon))
+
+    def test_session_counts_hide_old_data_for_stale_stopped_or_missing_provider(self):
+        daemon = replace(self.daemon, requests_served=168, tokens_generated=124521)
+        for unavailable in (None, replace(daemon, fresh=False), replace(daemon, alive=False)):
+            for columns in ("ladder", "full"):
+                with self.subTest(daemon=unavailable, columns=columns):
+                    text = self.render(daemon=unavailable, columns=columns)
+                    self.assertIn("session: N/A requests | N/A tokens", text)
+                    self.assertNotIn("124,521", text)
+
+    def test_session_counts_follow_restart_without_accumulating_or_changing_state(self):
+        before = json.dumps(self.state, sort_keys=True)
+        old = replace(self.daemon, requests_served=168, tokens_generated=124521)
+        self.assertIn("session: 168 requests | 124,521 tokens", self.render(daemon=old))
+        new = replace(old, pid=124, started_at=10000, requests_served=0, tokens_generated=0)
+        self.assertIn("session: 0 requests | 0 tokens", self.render(daemon=new))
         self.assertEqual(json.dumps(self.state, sort_keys=True), before)
 
     def test_final_passing_check_and_earliest_switch_share_one_event(self):

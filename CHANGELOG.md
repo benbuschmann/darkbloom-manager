@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.13 — 2026-09-16
+
+- Show session requests and tokens under `now` in both the score ladder and
+  `--columns full`. Read the provider's own counters and add thousands separators.
+- Show `N/A` for unavailable counters or stale/stopped provider state. Keep zero
+  as zero and follow the provider's counter reset after a restart.
+- Update the README example and explain session scope and output-token counting.
+  Add offline tests for reading and displaying the counters.
+
 ## 0.1.12 — 2026-09-16
 
 - Change the default `--average-samples` from 15 to 30. With the existing

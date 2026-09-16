@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.12"
+MANAGER_VERSION = "0.1.13"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -150,6 +150,7 @@ class LocalDaemonState:
     load_error_at: float = 0.0
     requests_served: int | None = None
     reconnect_count: int | None = None
+    tokens_generated: int | None = None
 
 
 @dataclass(frozen=True)
@@ -832,6 +833,7 @@ def read_daemon_state(path: Path, now: float | None = None) -> LocalDaemonState 
         load_error_at=float(load_error.get("at") or 0),
         requests_served=nonnegative_int(stats.get("requests_served")),
         reconnect_count=nonnegative_int(connectivity.get("reconnect_count")),
+        tokens_generated=nonnegative_int(stats.get("tokens_generated")),
     )
 
 
@@ -1288,6 +1290,15 @@ def daemon_status_line(daemon: LocalDaemonState | None) -> str:
     return f"RUNNING (pid {daemon.pid}) | warm: {warm} | {activity}"
 
 
+def session_stats_line(daemon: LocalDaemonState | None) -> str:
+    current = daemon if daemon and daemon.alive and daemon.fresh else None
+    requests = current.requests_served if current else None
+    tokens = current.tokens_generated if current else None
+    request_count = f"{requests:,}" if requests is not None else "N/A"
+    token_count = f"{tokens:,}" if tokens is not None else "N/A"
+    return f"session: {request_count} requests | {token_count} tokens"
+
+
 def format_duration(seconds: float) -> str:
     rounded = max(1, math.ceil(seconds))
     if rounded < 120:
@@ -1636,6 +1647,7 @@ def print_report(
     else:
         description = daemon_status_line(daemon)
     section_line("now", f"{description}    {mode}, {action}", "warm")
+    section_line("", session_stats_line(daemon))
     if not recovering:
         if (columns == "ladder" and decision.challenger_streak > 0
                 and decision.challenger in scores and current == warm and warm in scores
