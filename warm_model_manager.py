@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.11"
+MANAGER_VERSION = "0.1.12"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -2595,7 +2595,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="model score multiplier; repeat as needed",
     )
     parser.add_argument("--check-every", "--interval", type=int, default=60, metavar="SECONDS", help="check scores this often; minimum 60 seconds (default 60)")
-    parser.add_argument("--average-samples", "--history", type=int, default=15, metavar="COUNT", help="average up to this many recent pressure samples (default 15)")
+    parser.add_argument("--average-samples", "--history", type=int, default=30, metavar="COUNT", help="average up to this many recent pressure samples (default 30; 30 minutes at the default 60-second check interval)")
     improvement = parser.add_mutually_exclusive_group()
     improvement.add_argument("--switch-improvement-percent", type=nonnegative_float, default=25.0, metavar="PERCENT", help="required score improvement after switch cost; 25 means 25%% (default 25)")
     improvement.add_argument("--relative-margin", dest="switch_improvement_percent", type=legacy_margin_percent, default=argparse.SUPPRESS, metavar="FRACTION", help="legacy form of --switch-improvement-percent: 0.25 means 25%%; use only one form")

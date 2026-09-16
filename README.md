@@ -8,7 +8,7 @@ Example with illustrative values, with hourly probes and routing recovery enable
 
 ```text
 ================================================================================================================
-Darkbloom warm model manager 0.1.11    2026-09-16 07:31:52 PDT
+Darkbloom warm model manager 0.1.12    2026-09-16 07:31:52 PDT
 
 now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
          gemma-4-26b-qat-4bit: +261.17% improvement after switch cost; 2/3 consecutive checks passed
@@ -80,7 +80,7 @@ python3 warm_model_manager.py run --apply \
   --ignore-model 'EigenLabs/Qwen3.8-27B-4bit-mtp'
 ```
 
-The defaults check every minute, average up to 15 recent samples, require
+The defaults check every minute, average up to 30 samples from the past 30 minutes, require
 three consecutive checks that meet the 25% improvement requirement, and keep a model
 warm for at least 45 minutes before replacing it. Use the [switching flags](#switching-rules) to override them.
 
@@ -395,7 +395,7 @@ Neither choice resets samples, confirmations, saved timers or switching rules.
 | --- | --- |
 | `MODEL ID` | Exact ID accepted by `--ignore-model`, including capitalization and namespace. |
 | `NOW` | Current public network pressure: active requests divided by warm providers, with a minimum denominator of 1. |
-| `AVG 15m` | Average of retained pressure samples. The time label follows your check interval and sample limit. |
+| `AVG 30m` | Average of retained pressure samples. The time label follows your check interval and sample limit. |
 | `N` | Samples in that average. It can be below the limit after startup or during a data gap. |
 | `IN$/M` | Input price per million input tokens. |
 | `OUT$/M` | Output price per million output tokens. |
@@ -453,8 +453,8 @@ provider's throughput, actual token mix, or payouts, and does not reproduce
 per-request billing rounding.
 
 Samples expire after `check-every × average-samples` seconds, including while
-the manager is stopped. With the defaults of `60` and `15`, the average contains
-at most 15 samples from the past 15 minutes. The table's `N` column shows how many are
+the manager is stopped. With the defaults of `60` and `30`, the average contains
+at most 30 samples from the past 30 minutes. The table's `N` column shows how many are
 available. Changing either setting clears the old samples and resets the
 number of consecutive passing checks.
 
@@ -475,7 +475,7 @@ Weights must be positive; they can also name ignored models or future downloads.
 | Flag | Default | What it controls |
 | --- | --- | --- |
 | `--check-every SECONDS` | 60 | Seconds between checks. Minimum: 60. |
-| `--average-samples COUNT` | 15 | Maximum number of recent pressure samples to average. |
+| `--average-samples COUNT` | 30 | Maximum number of recent pressure samples to average. |
 | `--switch-after-checks COUNT` | 3 | Consecutive checks the same candidate must pass before switching. |
 | `--min-warm-time SECONDS` | 2700 | Minimum time to keep a warm model before replacing it. |
 
@@ -737,7 +737,17 @@ are available on GitHub. Script and state filenames stay the same across release
 Existing commands now show the timeline and score ladder. Add `--columns full`
 to restore the detailed score table. `--hide-ignored` remains optional; it hides
 excluded rows without changing their saved calculations or eligibility.
-This display update preserves saved state and switching rules.
+Choosing a display does not change saved state or switching rules.
+
+The default average now uses up to 30 samples at one-minute intervals. If your
+command includes `--average-samples 15` or `--history 15`, remove it or change it
+to `30` to use the new default window. A custom `--check-every` still changes the
+window length: interval × sample count.
+
+On the first check with the new sample limit, the existing timing-change rule
+clears the old averages and passing-check counts. The average fills as new
+samples arrive; it does not wait 30 minutes before scoring. Minimum warm time,
+pending launches and recovery state remain intact.
 
 After this update, an existing recovery still in its offline wait will use fresh
 scores when the wait ends. A launch already recorded as starting keeps its saved

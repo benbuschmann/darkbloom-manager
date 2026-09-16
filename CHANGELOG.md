@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.12 — 2026-09-16
+
+- Change the default `--average-samples` from 15 to 30. With the existing
+  60-second check interval, scores use up to 30 samples from the past 30 minutes.
+- Keep explicit sample limits and intervals working as before. Document the
+  existing sample/count reset when the averaging settings change.
+- Update CLI help, README defaults and the default-settings test. Recovery
+  timers, switch thresholds and minimum warm time are unchanged.
+
 ## 0.1.11 — 2026-09-16
 
 - After the 15-minute recovery wait, run a fresh score check and start the
