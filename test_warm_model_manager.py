@@ -8,7 +8,7 @@ import unittest
 
 import warm_model_manager as manager_module
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from urllib.error import HTTPError, URLError
@@ -1725,7 +1725,7 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.stop.assert_not_called()
         recovery, _ = self.tick(11514)
         self.assertEqual(recovery["phase"], "stopping")
-        self.stop.assert_called_once_with("darkbloom", 123)
+        self.stop.assert_called_once_with("darkbloom", 123, before_stop=ANY)
         self.assertEqual(self.send.call_count, 6)
         self.assertNotIn("fixture-", self.path.read_text())
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
@@ -2047,6 +2047,22 @@ class RoutingRecoveryTests(unittest.TestCase):
         with patch("warm_model_manager.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "", "permission denied")):
             with self.assertRaisesRegex(RuntimeError, "cannot verify"):
                 ORIGINAL_PROVIDER_SERVICES()
+
+    def test_traffic_or_cancellation_during_service_lookup_prevents_stop(self):
+        for change in (lambda: setattr(self.daemon, "return_value", replace(self.warm, inference_active=True)),
+                       lambda: setattr(self.daemon, "return_value", replace(self.warm, requests_served=1)),
+                       lambda: self.manager.stop(None, None)):
+            self.path.unlink(missing_ok=True)
+            self.manager = Manager(self.args)
+            self.daemon.return_value = self.warm
+            self.stop.side_effect = ORIGINAL_STOP_PROVIDER
+            def check_services():
+                change()
+                return {"io.darkbloom.provider": 123}
+            self.services.side_effect = check_services
+            with patch("warm_model_manager.subprocess.run") as run:
+                self.trigger()
+            run.assert_not_called()
 
     def test_real_http_error_parser_preserves_only_structured_failure_code(self):
         with patch("warm_model_manager.build_opener") as build:

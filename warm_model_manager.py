@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
@@ -856,12 +856,14 @@ def provider_services() -> dict[str, int]:
     return services
 
 
-def stop_provider(darkbloom: str, expected_pid: int) -> None:
+def stop_provider(darkbloom: str, expected_pid: int, *, before_stop: Callable[[], bool] | None = None) -> None:
     # `darkbloom stop` is user-service scoped, not --config scoped. Check that
     # it will stop exactly the process observed through the selected state file.
     services = provider_services()
     if len(services) != 1 or set(services.values()) != {expected_pid}:
         raise RuntimeError("launchd provider does not match the observed process; stop refused")
+    if before_stop is not None and not before_stop():
+        raise RuntimeError("provider activity or identity changed before stop; shutdown cancelled")
     result = subprocess.run([darkbloom, "stop"], capture_output=True, text=True,
                             timeout=60, check=False)
     if result.returncode:
@@ -1971,9 +1973,15 @@ class Manager:
         for key in ("live_challenger_model", "live_challenger_streak", "dry_challenger_model", "dry_challenger_streak"):
             state.pop(key, None)
         save("stopping this provider once; model switching and other probes paused")
+        def still_idle() -> bool:
+            current = read_daemon_state(self.args.daemon_state, now=time.time())
+            return bool(not self.stop_requested and same_process(current)
+                        and warm_selection_matches(current, model) and not current.inference_active
+                        and current.requests_served == fresh.requests_served
+                        and current.reconnect_count == fresh.reconnect_count)
         try:
             if not self.stop_requested:
-                stop_provider(self.args.darkbloom, fresh.pid)
+                stop_provider(self.args.darkbloom, fresh.pid, before_stop=still_idle)
         except Exception as error:
             save("stop failed or timed out; checking actual process state, no retry: " + probe_debug_text(str(error), ""))
 
