@@ -2177,6 +2177,8 @@ class Manager:
                        fresh_start: bool = False) -> ScoreCheck:
         """Use one scoring/eligibility path for ordinary checks and recovery starts."""
         if fresh_start:
+            self.report_current = None
+            self.report_decision = Decision(None, "waiting for the first warm score check")
             manager_state["pressure_history"] = {}
             manager_state["state_schema"] = STATE_SCHEMA
             for key in ("live_challenger_model", "live_challenger_streak",

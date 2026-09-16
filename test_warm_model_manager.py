@@ -1760,7 +1760,11 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.path.write_text(json.dumps(state))
         self.manager = Manager(self.args)
         self.manager.weights["better"] = 2
+        self.manager.report_current = "good"
+        self.manager.report_decision = Decision("good", "old checks", "better", 99)
         recovery, output = self.tick(12415)
+        self.assertIsNone(self.manager.report_current)
+        self.assertIsNone(self.manager.report_decision.challenger)
         self.assertEqual(recovery["phase"], "starting")
         self.assertEqual(recovery["model"], "better")
         self.assertEqual(recovery["previous_model"], "good")
