@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.13"
+MANAGER_VERSION = "0.1.14"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -73,6 +73,9 @@ PROBE_TIMEOUT = 30
 SWITCH_PROBE_DELAY = 180
 RECOVERY_GRACE = 900
 RECOVERY_CHECK_SPACING = 300
+RECOVERY_PROBE_TIMEOUT = 120
+RECOVERY_PROBE_TOKENS = 16
+RECOVERY_IDLE_SETTLE = 60
 RECOVERY_OFFLINE_TIME = 900
 RECOVERY_VERIFY_TIME = 900
 RECOVERY_ACTIVE_PHASES = {"checking", "stopping", "offline", "starting", "verifying"}
@@ -733,7 +736,8 @@ def probe_response_details(body: bytes, token: str, http_status: int) -> dict[st
     return result
 
 
-def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
+def send_probe(kind: str, model: str, url: str, token: str, *,
+               timeout: float = PROBE_TIMEOUT, max_tokens: int = 64) -> dict[str, Any]:
     started = time.monotonic()
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if token:
@@ -743,13 +747,13 @@ def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
     request = Request(url, data=json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
-        "max_tokens": 64, "stream": False,
+        "max_tokens": max_tokens, "stream": False,
     }).encode("utf-8"), headers=headers, method="POST")
     # In particular, never send a local token through an environment proxy.
     opener = build_opener(ProxyHandler({}), ProbeRedirectHandler())
     result = {"http_status": None, "outcome": "FAILED"}
     try:
-        with opener.open(request, timeout=PROBE_TIMEOUT) as response:
+        with opener.open(request, timeout=timeout) as response:
             result["http_status"] = response.status
             provider = response.headers.get("X-Provider-Id", "")
             if (kind == "production" and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", provider)
@@ -773,10 +777,23 @@ def send_probe(kind: str, model: str, url: str, token: str) -> dict[str, Any]:
     except (URLError, OSError, ValueError, HTTPException) as error:
         cause = error.reason if isinstance(error, URLError) else error
         error_type = type(cause).__name__ if isinstance(cause, BaseException) else type(error).__name__
-        result.update(status="connection failed or timed out",
+        timed_out = isinstance(cause, TimeoutError)
+        result.update(status="request timed out" if timed_out else "connection or response failed",
+                      error_kind="timeout" if timed_out else "connection_or_response",
                       error=probe_debug_text(f"{error_type}: {cause}", token))
     result["elapsed_seconds"] = round(max(0, time.monotonic() - started), 2)
     return result
+
+
+def probe_failure_summary(result: dict[str, Any]) -> str:
+    if result.get("error_kind") == "timeout":
+        elapsed = result.get("elapsed_seconds")
+        seconds = f" after {elapsed:g}s" if type(elapsed) in (int, float) else ""
+        return "timed out" + seconds
+    status = result.get("http_status")
+    http = f"HTTP {status}" if status is not None else "HTTP N/A"
+    detail = result.get("error") or result.get("status") or "no completion received"
+    return f"failed ({http}: {probe_debug_text(detail, '')})"
 
 
 def migrate_default_state(state_path: Path) -> bool:
@@ -896,10 +913,16 @@ def routing_recovery(state: dict[str, Any]) -> dict[str, Any]:
             or value.get("phase") not in RECOVERY_ACTIVE_PHASES | {"monitoring", "locked"}
             or type(value.get("attempted")) is not bool):
         raise ValueError("invalid routing recovery state; inspect it before enabling changes")
-    for field in ("next_check_at", "warm_since", "command_at", "restart_at", "stopped_monotonic", "verify_by", "selection_check_at"):
+    for field in ("next_check_at", "warm_since", "command_at", "restart_at", "stopped_monotonic", "verify_by", "selection_check_at", "local_settle_until", "probe_retry_at"):
         if field in value and (type(value[field]) not in (int, float)
                               or not math.isfinite(value[field]) or value[field] < 0):
             raise ValueError("invalid routing recovery timing; inspect saved state")
+    if "local_settle_until" in value:
+        local = value.get("last_local_result")
+        if (value["phase"] not in {"checking", "verifying"} or not isinstance(local, dict)
+                or local.get("outcome") != "SUCCESS" or local.get("model") != value.get("model")
+                or type(local.get("at")) not in (int, float) or not math.isfinite(local["at"])):
+            raise ValueError("invalid saved local recovery check; inspect saved state")
     return value
 
 
@@ -1521,7 +1544,13 @@ def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
         elif phase in {"monitoring", "checking", "verifying"} and recovery.get("next_check_at") is not None:
             deadline = recovery.get("verify_by") if phase == "verifying" else None
             if deadline is None or max(now, recovery["next_check_at"]) < deadline:
-                events.append(TimelineEvent(recovery["next_check_at"], "recovery check, local then production self-route"))
+                text = ("check provider idle after local success; then production self-route"
+                        if recovery.get("local_settle_until") is not None
+                        else "recovery check, local then production self-route (only if idle)")
+                events.append(TimelineEvent(recovery["next_check_at"], text))
+            if recovery.get("local_settle_until") is not None:
+                if deadline is None or recovery["local_settle_until"] < deadline:
+                    events.append(TimelineEvent(recovery["local_settle_until"], "local idle-wait deadline; skip production check if still busy"))
             if phase == "verifying" and recovery.get("verify_by") is not None:
                 events.append(TimelineEvent(recovery["verify_by"], "recovery verification deadline; no repeat recovery shutdown"))
         elif phase in {"starting", "stopping"}:
@@ -1532,12 +1561,16 @@ def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
         notes.append("saved recovery is paused; resume with run --apply --recover-routing")
 
     if hourly_probes and apply and not recovering:
+        retry_at = recovery.get("probe_retry_at", 0)
+        if retry_at > now:
+            notes.append("regular/after-switch probes delayed until recovery retry time")
         kind, at = next_probe_slot(state, now)
+        at = max(at, retry_at)
         other = "production" if kind == "local" else "local"
         candidates = [(kind, at, False), (other, max(now, at) + PROBE_SPACING, at <= now)]
         extra = pending_switch_probe(state)
         if extra:
-            candidates.insert(0, ("after switch", extra["due_at"], False))
+            candidates.insert(0, ("after switch", max(extra["due_at"], retry_at), False))
         if not continuous:
             # `once` can attempt just one due probe before exiting.
             candidates = sorted(candidates, key=lambda item: item[1])[:1]
@@ -1747,6 +1780,13 @@ def print_report(
     else:
         recovery_status = f"{recovery.get('phase', 'waiting')}, {recovery.get('reason', 'waiting for one warm model')}"
     section_line("", "recovery " + recovery_status)
+    if recover_routing and apply:
+        for kind in ("local", "production"):
+            result = recovery.get("last_" + kind + "_result")
+            if isinstance(result, dict) and result.get("outcome") == "FAILED":
+                at = result.get("at")
+                when = f" at {timeline_clock(at, now)}" if type(at) in (int, float) else ""
+                section_line("", f"last recovery {kind} probe{when}: {probe_failure_summary(result)}")
     if not hourly_probes:
         section_line("", "probes off (--hourly-probes)", "muted")
 
@@ -1797,6 +1837,8 @@ class Manager:
             recovery["reason"] = reason
             if phase:
                 recovery["phase"] = phase
+                if phase not in {"checking", "verifying"}:
+                    recovery.pop("local_settle_until", None)
             write_json_atomic(self.state_path, state)
             if changed:
                 log("routing recovery: " + reason)
@@ -1816,15 +1858,54 @@ class Manager:
                         and daemon.requests_served > recovery["last_requests"])
 
         def recovered(daemon: LocalDaemonState) -> None:
+            recovery.pop("probe_retry_at", None)
             recovery.update(attempted=False, failures=0, last_requests=daemon.requests_served,
                             next_check_at=time.time() + RECOVERY_CHECK_SPACING)
             save("network requests reached this provider; recovery armed for a future failure", "monitoring")
 
+        def provider_change(daemon: LocalDaemonState | None) -> str | None:
+            if self.stop_requested:
+                return "manager is stopping"
+            if daemon is None or not daemon.alive:
+                return "provider is offline or its state is unavailable"
+            if not daemon.fresh:
+                return "provider state is stale"
+            if not same_process(daemon):
+                return "provider process changed"
+            if daemon.warm_models != (recovery["model"],):
+                return "warm model changed"
+            if not permitted(recovery["model"]):
+                return "warm model is now ignored or excluded"
+            if daemon.reconnect_count != recovery.get("reconnect_count"):
+                return "provider reconnected"
+            if daemon.requests_served is None:
+                return "network request counter is unavailable"
+            if daemon.requests_served < recovery["last_requests"]:
+                return "network request counter reset"
+            return None
+
+        def defer_check(reason: str) -> None:
+            recovery.pop("local_settle_until", None)
+            recovery.update(failures=0, next_check_at=time.time() + RECOVERY_CHECK_SPACING)
+            recovery["probe_retry_at"] = recovery["next_check_at"]
+            save(reason + "; no shutdown; retry in 5m once idle",
+                 "verifying" if phase == "verifying" else "monitoring")
+
         def probe(kind: str, daemon: LocalDaemonState) -> dict[str, Any]:
             url, token = probe_credentials(kind, daemon, self.args.local_endpoint_file, self.args.prod_token_file)
+            timeout = self.args.recovery_probe_timeout
+            # Save a backoff before POST, so an interrupted request cannot be
+            # replayed on manager restart while it might still be running.
+            recovery["next_check_at"] = time.time() + timeout + RECOVERY_CHECK_SPACING
+            recovery["probe_retry_at"] = recovery["next_check_at"]
+            write_json_atomic(self.state_path, state)
             log(f"recovery {kind} probe: SENDING; model={json.dumps(recovery['model'])}; "
-                + ("route=self" if kind == "production" else "loopback"))
-            result = send_probe(kind, recovery["model"], url, token)
+                + ("route=self" if kind == "production" else "loopback")
+                + f"; max_tokens={RECOVERY_PROBE_TOKENS}; timeout={timeout:g}s")
+            result = send_probe(kind, recovery["model"], url, token,
+                                timeout=timeout, max_tokens=RECOVERY_PROBE_TOKENS)
+            recovery["next_check_at"] = time.time() + RECOVERY_CHECK_SPACING
+            recovery["probe_retry_at"] = recovery["next_check_at"]
             recovery["last_" + kind + "_result"] = {**result, "at": time.time(), "model": recovery["model"]}
             detail = "; ".join(f"{key}={result[key]}" for key in
                                ("status", "elapsed_seconds", "provider_id", "error") if key in result)
@@ -1947,6 +2028,7 @@ class Manager:
                             or (recovery.get("last_requests") is not None
                                 and daemon.requests_served < recovery["last_requests"]))
         if identity_changed:
+            recovery.pop("probe_retry_at", None)
             recovery.update(model=model, pid=daemon.pid, started_at=daemon.started_at,
                             reconnect_count=daemon.reconnect_count, last_requests=daemon.requests_served,
                             warm_since=now, failures=0, next_check_at=now + RECOVERY_GRACE)
@@ -1957,11 +2039,25 @@ class Manager:
             save("attempt used; waiting for this provider's network traffic or reset-recovery", "locked")
             return
         if phase == "verifying" and now >= recovery["verify_by"]:
+            recovery.pop("local_settle_until", None)
             save("this provider's routing is unconfirmed after 15 minutes; left running, no retry", "locked")
             return
-        if daemon.inference_active:
-            recovery.update(failures=0, next_check_at=now + RECOVERY_CHECK_SPACING)
-            save("provider busy; recovery checks deferred", "verifying" if phase == "verifying" else "monitoring")
+        settling = recovery.get("local_settle_until")
+        if settling is not None:
+            if now < recovery["last_local_result"]["at"]:
+                defer_check("clock moved backwards during local idle wait; production check skipped")
+                return
+            if now >= settling:
+                defer_check("local probe succeeded, but idle was not confirmed within 60s; production check skipped")
+                return
+            if daemon.inference_active:
+                recovery["next_check_at"] = min(now + 15, settling)
+                save("local probe succeeded; waiting for provider idle before production self-route")
+                return
+        elif daemon.inference_active:
+            recovery.update(failures=0, next_check_at=max(recovery.get("next_check_at", 0), now + 15))
+            save("provider reports busy; recovery waits for idle (this can include a local request)",
+                 "verifying" if phase == "verifying" else "monitoring")
             return
         if now < recovery.get("next_check_at", now):
             return
@@ -1969,26 +2065,45 @@ class Manager:
         if now > recovery.get("next_check_at", now) + RECOVERY_CHECK_SPACING:
             recovery["failures"] = 0
         recovery["next_check_at"] = now + RECOVERY_CHECK_SPACING
-        save("checking local inference and production self-routing")
+        save("local probe already passed; checking production self-routing" if settling is not None
+             else "checking local inference and production self-routing")
         try:
             # Validate both records before sending either request.
             for kind in ("local", "production"):
                 probe_credentials(kind, daemon, self.args.local_endpoint_file, self.args.prod_token_file)
-            local = probe("local", daemon)
+            if settling is None:
+                local = probe("local", daemon)
+            else:
+                local = recovery["last_local_result"]
+                # Consume the saved success before sending production; never
+                # reuse it after an interruption or another probe cycle.
+                recovery.pop("local_settle_until", None)
+                write_json_atomic(self.state_path, state)
             fresh = read_daemon_state(self.args.daemon_state, now=time.time())
             if traffic(fresh):
                 recovered(fresh)
                 return
-            if (self.stop_requested or not same_process(fresh) or not warm_selection_matches(fresh, model)
-                    or fresh.inference_active or local.get("outcome") != "SUCCESS"):
-                recovery["failures"] = 0
-                save("local check failed, provider changed or became busy; shutdown not permitted",
-                     "verifying" if phase == "verifying" else "monitoring")
+            changed = provider_change(fresh)
+            if changed:
+                defer_check(changed + " after local probe; production check skipped")
+                return
+            if local.get("outcome") != "SUCCESS":
+                defer_check("local probe " + probe_failure_summary(local) + "; production check skipped")
+                return
+            if phase == "verifying" and time.time() >= recovery["verify_by"]:
+                save("verification deadline passed during local probe; no production request or shutdown", "locked")
+                return
+            if fresh.inference_active:
+                # Darkbloom may not have rewritten its busy flag yet after
+                # responding. Recheck later without sending another local job.
+                recovery["local_settle_until"] = settling or time.time() + RECOVERY_IDLE_SETTLE
+                recovery["next_check_at"] = min(time.time() + 15, recovery["local_settle_until"])
+                save("local probe succeeded; waiting up to 60s for provider idle before production self-route",
+                     "verifying" if phase == "verifying" else "checking")
                 return
             production = probe("production", fresh)
         except (OSError, ValueError) as error:
-            recovery["failures"] = 0
-            save(probe_debug_text(str(error), ""), "verifying" if phase == "verifying" else "monitoring")
+            defer_check(probe_debug_text(str(error), ""))
             return
         fresh = read_daemon_state(self.args.daemon_state, now=time.time())
         if traffic(fresh):
@@ -1998,11 +2113,18 @@ class Manager:
             save("self-route succeeded for the account; this provider remains unconfirmed"
                  if production.get("outcome") == "SUCCESS" else "routing check failed; left running, no further shutdown")
             return
-        if (not same_process(fresh) or not warm_selection_matches(fresh, model) or fresh.inference_active
-                or fresh.reconnect_count != recovery.get("reconnect_count")
-                or production.get("http_status") != 503 or production.get("error_code") != "model_not_loaded"):
-            recovery["failures"] = 0
-            save("no confirmed routing failure; shutdown not permitted", "monitoring")
+        changed = provider_change(fresh)
+        if changed:
+            defer_check(changed + " after production probe")
+            return
+        if fresh.inference_active:
+            defer_check("provider became busy during production probe")
+            return
+        if production.get("http_status") != 503 or production.get("error_code") != "model_not_loaded":
+            summary = ("production self-route succeeded for the account"
+                       if production.get("outcome") == "SUCCESS"
+                       else "production probe " + probe_failure_summary(production))
+            defer_check(summary + "; no confirmed routing failure")
             return
         recovery["failures"] += 1
         save(f"{recovery['failures']}/3 local successes with self-route model_not_loaded", "checking")
@@ -2019,10 +2141,9 @@ class Manager:
         if traffic(fresh):
             recovered(fresh)
             return
-        if (self.stop_requested or not same_process(fresh) or not warm_selection_matches(fresh, model)
-                or fresh.inference_active or fresh.reconnect_count != recovery.get("reconnect_count")):
-            recovery["failures"] = 0
-            save("provider changed or became busy before shutdown; cancelled", "monitoring")
+        changed = provider_change(fresh)
+        if changed or fresh.inference_active:
+            defer_check((changed or "provider became busy") + " before shutdown")
             return
         recovery.update(attempted=True, phase="stopping", command_at=time.time(), config_digest=digest,
                         local_flags=local_endpoint_start_flags(self.args.local_endpoint_file, fresh))
@@ -2054,7 +2175,9 @@ class Manager:
                          if self.state_path.exists() else {})
         if not isinstance(manager_state, dict):
             raise ValueError("invalid manager state")
-        if routing_recovery(manager_state).get("phase") in RECOVERY_ACTIVE_PHASES:
+        recovery = routing_recovery(manager_state)
+        if (recovery.get("phase") in RECOVERY_ACTIVE_PHASES
+                or now < recovery.get("probe_retry_at", 0)):
             return
         # Keep clock correction confined to the regular schedule.
         _, regular_at = next_probe_slot(manager_state, now)
@@ -2586,6 +2709,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true", help="enable model changes, opted-in probes and routing recovery; default is dry-run")
     parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart, plus one self-route prompt 3 minutes after switch warm-up; enables the local endpoint on model switches; requires --apply")
     parser.add_argument("--recover-routing", action="store_true", help="optional routing recovery: after 15m warm and 3 local successes/self-route model_not_loaded failures 5m apart, stop for 15m, then use fresh scores to start the highest eligible model once; requires run --apply, local endpoint and production token; reset-recovery clears an inactive attempt")
+    parser.add_argument("--recovery-probe-timeout", type=positive_float, default=RECOVERY_PROBE_TIMEOUT,
+                        metavar="SECONDS", help="timeout for each recovery request (default 120, range 30–300); recovery uses 16 output tokens; hourly probes keep their 30-second timeout")
     parser.add_argument("--prod-token-file", type=Path, default=DEFAULT_PROD_TOKEN_PATH, help="private production token file; save with set-prod-token (default ~/.darkbloom/warm-model-manager-prod-token)")
     parser.add_argument("--local-endpoint-file", type=Path, default=DEFAULT_LOCAL_ENDPOINT_PATH, help="Darkbloom local endpoint metadata (default ~/.darkbloom/local.json; respects DARKBLOOM_LOCAL_DIR)")
     parser.add_argument("--columns", choices=("ladder", "full"), default="ladder", help="score display: ladder (default) or full table with current pressure, sample count and separate prices")
@@ -2670,6 +2795,8 @@ def main() -> int:
         raise SystemExit("--min-warm-time must be zero or greater")
     if args.warmup_timeout < 60:
         raise SystemExit("--warmup-timeout must be at least 60 seconds")
+    if not 30 <= args.recovery_probe_timeout <= 300:
+        raise SystemExit("--recovery-probe-timeout must be between 30 and 300 seconds")
     if args.switch_cost >= args.decision_horizon:
         raise SystemExit("--switch-cost must be less than --decision-horizon")
 

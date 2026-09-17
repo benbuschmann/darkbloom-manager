@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.14 — 2026-09-16
+
+- Give recovery probes a 120-second timeout and 16-token output limit. Add
+  `--recovery-probe-timeout` for 30–300 seconds; regular probe limits stay the same.
+- After a successful local probe, allow up to 60 seconds for the busy flag to
+  clear before sending production self-route. Preserve that result across manager
+  restarts and show the idle checks and deadline in the timeline.
+- Report the actual timeout, HTTP failure or provider change. Keep the last
+  failed probe results visible with timestamps. Back off five minutes after failed
+  checks, including regular probes, without continually moving the deadline while busy.
+- Keep shutdown restricted to three local successes paired with confirmed
+  self-route `model_not_loaded` failures. Add offline regression tests.
+
 ## 0.1.13 — 2026-09-16
 
 - Show session requests and tokens under `now` in both the score ladder and

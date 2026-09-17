@@ -8,7 +8,7 @@ Example with illustrative values, with hourly probes and routing recovery enable
 
 ```text
 ================================================================================================================
-Darkbloom warm model manager 0.1.13    2026-09-16 07:31:52 PDT
+Darkbloom warm model manager 0.1.14    2026-09-16 07:31:52 PDT
 
 now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
          session: 168 requests | 124,521 tokens
@@ -276,6 +276,30 @@ The sequence is fixed:
    continue during this verification. If this provider receives network requests,
    recovery is confirmed. Otherwise leave it running and report recovery as
    unconfirmed.
+
+Recovery probes ask for at most 16 output tokens and use a 120-second network
+timeout per request. For a slower local model, set `--recovery-probe-timeout 180`
+(allowed range: 30–300 seconds). Score checks can be delayed while a request is
+waiting for a response. Hourly and post-switch probes retain their 30-second
+timeout and 64-token limit.
+
+If a local probe succeeds but Darkbloom still reports busy, recovery checks for
+idle every 15 seconds, for up to 60 seconds. It keeps the successful result during
+that wait and sends the production check once idle is confirmed. It does not send
+another local prompt. The wait and deadline appear under `next`.
+Score-based switching and regular probes pause during this short idle wait.
+
+A timeout, failed check or provider change clears the failure count. The next
+recovery attempt waits five minutes after the result, then waits for idle.
+Regular and post-switch probes also wait through that five-minute pause. Busy
+checks do not keep extending it by another five minutes. Restarting the manager
+preserves the pause and any unfinished idle wait.
+
+The output distinguishes local timeouts, HTTP errors, stale state, process/model
+changes and reconnects. The last failed local and production results remain under
+`sources` with their timestamps, even if the latest status becomes “busy.” Busy
+can include a local request; it does not by itself prove that network traffic arrived.
+Local timeouts never authorize a recovery shutdown.
 
 The first recovery selection uses one fresh pressure sample with the usual
 85% input / 15% output price blend and model weights. Nothing is warm at that

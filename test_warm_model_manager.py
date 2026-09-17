@@ -94,7 +94,7 @@ def timeline_lines(state, now, enabled=True, apply=True):
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.13")
+        self.assertEqual(MANAGER_VERSION, "0.1.14")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -1491,6 +1491,19 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "FAILED")
         self.assertIn("TimeoutError", result["error"])
         self.assertNotIn("SECRET", json.dumps(result))
+        self.assertEqual(result["error_kind"], "timeout")
+
+    def test_recovery_request_limits_and_wrapped_timeout(self):
+        with patch("warm_model_manager.build_opener") as build:
+            build.return_value.open.side_effect = URLError(TimeoutError("fixture-secret"))
+            result = send_probe("local", "good", "http://127.0.0.1:8000/v1/chat/completions",
+                                "fixture-secret", timeout=180, max_tokens=16)
+        call = build.return_value.open.call_args
+        self.assertEqual(call.kwargs["timeout"], 180)
+        self.assertEqual(json.loads(call.args[0].data)["max_tokens"], 16)
+        self.assertEqual(result["error_kind"], "timeout")
+        self.assertEqual(result["status"], "request timed out")
+        self.assertNotIn("fixture-secret", json.dumps(result))
 
     def test_malicious_response_headers_and_oversized_body_are_not_logged(self):
         for provider in ("SECRET", "provider\nforged log"):
@@ -1653,7 +1666,7 @@ class RoutingRecoveryTests(unittest.TestCase):
         self.catalog = self.mock("catalog_model_ids", return_value={"good"})
         self.capacity = self.mock("fetch_capacity", return_value={"good": CapacitySample("good", 1, 1, 1)})
         self.prices = self.mock("fetch_model_prices", return_value=({"good": ModelPrice(1, 1)}, ModelPrice(None, None)))
-        self.send = self.mock("send_probe", side_effect=lambda kind, *args: self.ok() if kind == "local" else self.failure())
+        self.send = self.mock("send_probe", side_effect=lambda kind, *args, **kw: self.ok() if kind == "local" else self.failure())
 
     def mock(self, name, **kwargs):
         p = patch("warm_model_manager." + name, **kwargs)
@@ -1713,6 +1726,219 @@ class RoutingRecoveryTests(unittest.TestCase):
         with patch.object(sys, "argv", ["manager", "once", "--apply", "--recover-routing"]):
             with self.assertRaisesRegex(SystemExit, "requires run"):
                 main()
+
+    def test_recovery_timeout_default_override_and_invalid_values(self):
+        self.assertEqual(self.args.recovery_probe_timeout, 120)
+        self.args.recovery_probe_timeout = 180
+        self.tick(10000)
+        _, output = self.tick(10900)
+        self.assertIn("max_tokens=16; timeout=180s", output)
+        for call in self.send.call_args_list:
+            self.assertEqual(call.kwargs, {"timeout": 180, "max_tokens": 16})
+        for value in ("0", "29", "301", "nan", "inf"):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), \
+                    patch.object(sys, "argv", ["manager", "--recovery-probe-timeout", value]):
+                with self.assertRaises(SystemExit):
+                    main()
+
+    def test_slow_probe_starts_spacing_after_completion(self):
+        self.tick(10000)
+        def reply(kind, *args, **kwargs):
+            self.now.return_value += 80 if kind == "local" else 10
+            return self.ok() if kind == "local" else self.failure()
+        self.send.side_effect = reply
+        recovery, _ = self.tick(10900)
+        self.assertEqual(recovery["failures"], 1)
+        self.assertEqual(recovery["next_check_at"], 11290)
+        self.tick(11200)
+        self.assertEqual(self.send.call_count, 2)
+        self.stop.assert_not_called()
+
+    def test_local_timeout_preserves_backoff_while_busy_and_skips_other_probes(self):
+        self.tick(10000)
+        def timeout(*args, **kwargs):
+            self.now.return_value += 120
+            self.daemon.return_value = replace(self.warm, inference_active=True)
+            return {"outcome": "FAILED", "http_status": None, "error_kind": "timeout",
+                    "elapsed_seconds": 120.01, "error": "TimeoutError: timed out"}
+        self.send.side_effect = timeout
+        recovery, output = self.tick(10900)
+        self.assertIn("local probe timed out after 120.01s; production check skipped", recovery["reason"])
+        self.assertEqual(recovery["failures"], 0)
+        self.assertEqual(recovery["next_check_at"], 11320)
+        self.manager = Manager(self.args)
+        recovery, _ = self.tick(11035)
+        self.assertIn("provider reports busy", recovery["reason"])
+        self.assertEqual(recovery["next_check_at"], 11320)
+        self.assertEqual(recovery["last_local_result"]["error_kind"], "timeout")
+        # Even an idle snapshot must not cause a due hourly probe during backoff.
+        self.daemon.return_value = self.warm
+        self.manager.probe_if_due()
+        self.tick(11319)
+        self.assertEqual(self.send.call_count, 1)
+        self.send.side_effect = lambda kind, *a, **kw: self.ok() if kind == "local" else self.failure()
+        self.manager = Manager(self.args)
+        recovery, _ = self.tick(11320)
+        self.assertEqual(recovery["failures"], 1)
+        self.assertEqual([call.args[0] for call in self.send.call_args_list], ["local", "local", "production"])
+        self.stop.assert_not_called()
+
+    def test_local_success_waits_for_idle_and_survives_manager_restart(self):
+        self.tick(10000)
+        def reply(kind, *args, **kwargs):
+            if kind == "local":
+                self.daemon.return_value = replace(self.warm, inference_active=True)
+            return self.ok() if kind == "local" else self.failure()
+        self.send.side_effect = reply
+        recovery, _ = self.tick(10900)
+        self.assertEqual(recovery["local_settle_until"], 10960)
+        self.assertEqual(recovery["phase"], "checking")
+        self.tick(10915)
+        self.manager.probe_if_due()
+        self.assertEqual(self.send.call_count, 1)
+        self.manager = Manager(self.args)
+        self.daemon.return_value = self.warm
+        recovery, _ = self.tick(10930)
+        self.assertNotIn("local_settle_until", recovery)
+        self.assertEqual(recovery["failures"], 1)
+        self.assertEqual([call.args[0] for call in self.send.call_args_list], ["local", "production"])
+        self.tick(10945)
+        self.assertEqual(self.send.call_count, 2)
+        self.stop.assert_not_called()
+
+    def test_local_idle_wait_expires_without_reusing_success_or_shutting_down(self):
+        self.tick(10000)
+        def reply(*args, **kwargs):
+            self.daemon.return_value = replace(self.warm, inference_active=True)
+            return self.ok()
+        self.send.side_effect = reply
+        self.tick(10900)
+        recovery, _ = self.tick(10960)
+        self.assertIn("idle was not confirmed within 60s; production check skipped", recovery["reason"])
+        self.assertNotIn("local_settle_until", recovery)
+        self.assertEqual(recovery["next_check_at"], 11260)
+        self.assertEqual(recovery["failures"], 0)
+        self.assertEqual(self.send.call_count, 1)
+        self.stop.assert_not_called()
+
+    def test_third_local_success_can_settle_then_complete_confirmed_recovery(self):
+        self.tick(10000)
+        self.tick(10900)
+        self.tick(11200)
+        def reply(kind, *args, **kwargs):
+            if kind == "local":
+                self.daemon.return_value = replace(self.warm, inference_active=True)
+            return self.ok() if kind == "local" else self.failure()
+        self.send.side_effect = reply
+        recovery, _ = self.tick(11500)
+        self.assertEqual(recovery["failures"], 2)
+        self.stop.assert_not_called()
+        self.daemon.return_value = self.warm
+        recovery, _ = self.tick(11515)
+        self.assertEqual(recovery["phase"], "stopping")
+        self.assertEqual(recovery["failures"], 3)
+        self.assertEqual(self.send.call_count, 6)
+        self.stop.assert_called_once_with("darkbloom", 123, before_stop=ANY)
+
+    def test_bad_saved_local_success_is_rejected_before_any_probe(self):
+        self.tick(10000)
+        state = json.loads(self.path.read_text())
+        state["routing_recovery"].update(phase="checking", local_settle_until=10960,
+                                         last_local_result={"outcome": "FAILED", "model": "good", "at": 10900})
+        self.path.write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, "invalid saved local recovery check"):
+            self.tick(10930)
+        self.send.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_clock_change_cannot_reuse_future_local_success(self):
+        self.tick(10000)
+        def reply(*args, **kwargs):
+            self.daemon.return_value = replace(self.warm, inference_active=True)
+            return self.ok()
+        self.send.side_effect = reply
+        self.tick(10900)
+        self.manager = Manager(self.args)
+        self.daemon.return_value = self.warm
+        recovery, _ = self.tick(10800)
+        self.assertIn("clock moved backwards", recovery["reason"])
+        self.assertNotIn("local_settle_until", recovery)
+        self.assertEqual(self.send.call_count, 1)
+        self.stop.assert_not_called()
+
+    def test_local_wait_is_cancelled_by_traffic_or_provider_change(self):
+        for changed in (replace(self.warm, requests_served=1), replace(self.warm, pid=999),
+                        replace(self.warm, warm_models=("other",)), replace(self.warm, fresh=False),
+                        replace(self.warm, reconnect_count=2)):
+            with self.subTest(changed=changed):
+                self.path.unlink(missing_ok=True)
+                self.manager = Manager(self.args)
+                self.daemon.return_value = self.warm
+                self.send.reset_mock()
+                self.tick(10000)
+                def reply(*args, **kwargs):
+                    self.daemon.return_value = replace(self.warm, inference_active=True)
+                    return self.ok()
+                self.send.side_effect = reply
+                self.tick(10900)
+                self.daemon.return_value = changed
+                recovery, _ = self.tick(10915)
+                self.assertNotIn("local_settle_until", recovery)
+                self.assertEqual(recovery["failures"], 0)
+                self.assertEqual(self.send.call_count, 1)
+                self.stop.assert_not_called()
+
+    def test_post_local_provider_changes_have_specific_reasons(self):
+        for changed, reason in (
+                (replace(self.warm, pid=999), "provider process changed"),
+                (replace(self.warm, warm_models=("other",)), "warm model changed"),
+                (replace(self.warm, fresh=False), "provider state is stale"),
+                (replace(self.warm, reconnect_count=2), "provider reconnected"),
+                (replace(self.warm, requests_served=None), "network request counter is unavailable")):
+            with self.subTest(reason=reason):
+                self.path.unlink(missing_ok=True)
+                self.manager = Manager(self.args)
+                self.daemon.return_value = self.warm
+                self.send.reset_mock()
+                self.tick(10000)
+                def reply(*args, **kwargs):
+                    self.daemon.return_value = changed
+                    return self.ok()
+                self.send.side_effect = reply
+                recovery, _ = self.tick(10900)
+                self.assertIn(reason + " after local probe; production check skipped", recovery["reason"])
+                self.assertEqual(self.send.call_count, 1)
+                self.stop.assert_not_called()
+
+    def test_interrupted_probe_saves_backoff_before_send(self):
+        self.tick(10000)
+        self.send.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(10900)
+        recovery = json.loads(self.path.read_text())["routing_recovery"]
+        self.assertEqual(recovery["next_check_at"], 11320)
+        self.assertEqual(recovery["probe_retry_at"], 11320)
+        self.manager = Manager(self.args)
+        self.tick(11000)
+        self.manager.probe_if_due()
+        self.assertEqual(self.send.call_count, 1)
+        self.stop.assert_not_called()
+
+    def test_slow_local_check_cannot_send_production_past_verification_deadline(self):
+        self.restart()
+        state = json.loads(self.path.read_text())
+        state["routing_recovery"].update(verify_by=12620)
+        self.path.write_text(json.dumps(state))
+        def reply(*args, **kwargs):
+            self.now.return_value = 12630
+            return self.ok()
+        self.send.side_effect = reply
+        self.send.reset_mock()
+        recovery, _ = self.tick(12610)
+        self.assertEqual(recovery["phase"], "locked")
+        self.assertIn("verification deadline passed", recovery["reason"])
+        self.assertEqual(self.send.call_count, 1)
+        self.stop.assert_called_once()
 
     def test_observes_full_warm_grace_then_three_spaced_failures(self):
         self.tick(10000)
@@ -2083,7 +2309,7 @@ class RoutingRecoveryTests(unittest.TestCase):
         state = json.loads(self.path.read_text())
         self.assertEqual(state["last_switch_at"], 12430)
         self.assertNotIn("pending_switch", state)
-        self.send.side_effect = lambda *args: self.ok()
+        self.send.side_effect = lambda *args, **kw: self.ok()
         recovery, output = self.tick(12610)
         self.assertEqual(recovery["phase"], "verifying")
         self.assertIn("this provider remains unconfirmed", output)
@@ -2119,7 +2345,7 @@ class RoutingRecoveryTests(unittest.TestCase):
                     self.path.unlink(missing_ok=True)
                     self.manager = Manager(self.args)
                     self.daemon.return_value = self.warm
-                    self.send.side_effect = lambda kind, *a: self.ok() if kind == "local" else self.failure()
+                    self.send.side_effect = lambda kind, *a, **kw: self.ok() if kind == "local" else self.failure()
                     self.discovery.side_effect = None
                     self.tick(10000)
                     self.tick(10900)
@@ -2130,7 +2356,7 @@ class RoutingRecoveryTests(unittest.TestCase):
                     if when == "discovery":
                         self.discovery.side_effect = change
                     else:
-                        def reply(kind, *args):
+                        def reply(kind, *args, **kwargs):
                             if kind == when:
                                 change()
                             return self.ok() if kind == "local" else self.failure()
@@ -2147,13 +2373,13 @@ class RoutingRecoveryTests(unittest.TestCase):
             with self.subTest(response=response):
                 self.path.unlink(missing_ok=True)
                 self.manager = Manager(self.args)
-                self.send.side_effect = lambda kind, *a: self.ok() if kind == "local" else response
+                self.send.side_effect = lambda kind, *a, **kw: self.ok() if kind == "local" else response
                 recovery, _ = self.trigger()
                 self.assertEqual(recovery["failures"], 0)
                 self.stop.assert_not_called()
 
     def test_local_failure_and_missing_token_cannot_trigger_stop(self):
-        self.send.side_effect = lambda *a: self.failure()
+        self.send.side_effect = lambda *a, **kw: self.failure()
         recovery, _ = self.trigger()
         self.assertEqual(recovery["failures"], 0)
         self.assertTrue(all(call.args[0] == "local" for call in self.send.call_args_list))
@@ -2484,6 +2710,34 @@ class TimelineReportTests(unittest.TestCase):
         self.assertIn("production self-route", events[5].text)
         self.assertEqual(notes, [])
         self.assertEqual(json.dumps(self.state, sort_keys=True), before)
+
+    def test_local_idle_wait_shows_followup_and_deadline_without_extra_probes(self):
+        self.state["routing_recovery"].update(
+            phase="checking", model="warm", next_check_at=10015, local_settle_until=10060,
+            last_local_result={"outcome": "SUCCESS", "model": "warm", "at": 10000})
+        events, notes = self.timeline()
+        self.assertIn("check provider idle after local success", events[0].text)
+        self.assertEqual(events[0].at, 10015)
+        self.assertTrue(any("idle-wait deadline" in event.text and event.at == 10060 for event in events))
+        self.assertFalse(any("probe," in event.text for event in events))
+        self.assertIn("paused", " ".join(notes))
+
+    def test_failed_probe_stays_visible_and_other_probe_times_respect_backoff(self):
+        self.state["routing_recovery"].update(
+            reason="provider reports busy", next_check_at=10300, probe_retry_at=10300,
+            last_local_result={"outcome": "FAILED", "error_kind": "timeout", "elapsed_seconds": 120,
+                               "http_status": None, "error": "TimeoutError: timed out", "at": 9990})
+        self.state["probes"]["next_at"] = 9990
+        events, notes = self.timeline()
+        probes = [event for event in events if "probe," in event.text]
+        self.assertEqual(len(probes), 3)
+        self.assertTrue(all(event.at >= 10300 for event in probes))
+        self.assertIn("delayed until recovery retry time", " ".join(notes))
+        for columns in ("ladder", "full"):
+            text = self.render(columns=columns)
+            self.assertIn("provider reports busy", text)
+            self.assertIn("last recovery local probe at", text)
+            self.assertIn("timed out after 120s", text)
 
     def test_session_counts_in_both_views_and_modes(self):
         daemon = replace(self.daemon, requests_served=168, tokens_generated=124521)
