@@ -8,7 +8,7 @@ Example with illustrative values, with hourly probes and routing recovery enable
 
 ```text
 ================================================================================================================
-Darkbloom warm model manager 0.1.14    2026-09-16 07:31:52 PDT
+Darkbloom warm model manager 0.1.15    2026-09-24 07:31:52 PDT
 
 now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
          session: 168 requests | 124,521 tokens
@@ -452,6 +452,7 @@ Redirected output stays plain text. Set `NO_COLOR=1` to disable color in a termi
 | `WOULD SWITCH` | A dry run selected a different model; no launch occurs. |
 | `SWITCH` | The manager plans to load a different model. The following log lines report the launch result. |
 | `WARMING` | A launch was requested; the manager is waiting for Darkbloom to confirm the model is warm. |
+| `BLOCKED` | A switch failed or exceeded its warm-up timeout. The manager checks provider state without repeating the launch. |
 | `DEFERRED` | A model was selected, but a condition such as active work or minimum warm time blocks the launch. |
 | `WAIT` | There is no eligible scored target, or the current model's score is unavailable. |
 
@@ -663,7 +664,7 @@ write permissions.
 | Catalog IDs, source, fetch time, and errors | Keep catalog rows visible during an outage and identify stale catalog data. |
 | Current model, process identity, warm-start time, and last switch time | Track how long the model has been warm. |
 | Candidate and count of consecutive passing checks | Resume progress toward `--switch-after-checks` across restarts. Live and dry-run counts are separate. |
-| Pending target, launch time, and any command error | Wait for warm-up without issuing repeated restarts. |
+| Pending target, launch time, process identities, command error, and replacement observations | Confirm warm-up or a replacement selection without issuing repeated restarts. |
 | Percentage requirement, switch cost, and decision horizon | Reset passing-check counts when the switch rule changes. |
 | Last decision, scoring mix, selection policy, timing settings, and format/release metadata | Explain the last check and detect incompatible saved settings. |
 | Probe schedule and latest result | Remember the next endpoint and time, plus the last attempt's model, outcome, duration, HTTP status, redacted error or skip reason, finish reason, token counts and serving provider ID when available. |
@@ -735,11 +736,27 @@ warm time (`--min-warm-time`), or the improvement after switch cost may be below
 `--switch-improvement-percent`. A busy, stopped, or stale provider also blocks
 a switch. Dry runs use the same rules.
 
-A failed or timed-out launch command, load error, or overdue warm-up blocks
-automatic retries. The pending target is saved before attempting the launch;
-fresh daemon state can still confirm success if the command timed out. Inspect
-`darkbloom status` and the provider logs, fix the loading problem, then stop the
-manager before editing pending state.
+A failed or timed-out launch command, load error, or overdue warm-up shows
+`BLOCKED` and prevents automatic retries. The pending target is saved before
+the launch; fresh daemon state can still confirm success afterward.
+
+If you start Darkbloom with a different model, the manager can retire the old
+request. It requires a provider started after that request, exactly one eligible
+model warm and advertised, and a matching singleton `backend.preload_models`
+setting in the selected config file. The same process and selection must pass
+two checks at least `--check-every` seconds apart, after the old warm-up timeout.
+A changed process ID alone is not enough: normal manager switches restart the
+provider too. Missing or ambiguous evidence keeps the switch blocked.
+
+Once confirmed, the manager adopts the warm model, clears the old passing-check
+counts and post-switch probe, and starts a new minimum warm-time clock. Pressure
+history and prices remain. It does not launch or send a post-switch probe just
+because it adopted your selection. Existing pending requests saved by 0.1.14
+use the same checks; you do not need to delete the state file.
+
+If nothing is warm or the startup selection still names the failed target,
+inspect `darkbloom status` and the provider logs and fix the loading problem.
+Do not clear pending state while a launch may still be running.
 
 ### What does Ctrl-C stop?
 

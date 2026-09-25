@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.15 — 2026-09-24
+
+- Reconcile old pending switches when a later provider session has a different
+  eligible model warm, with matching advertised and startup preload selections
+  confirmed across two checks. Support existing saved requests from 0.1.14.
+- Resume normal scoring with fresh confirmation counts and minimum warm time;
+  preserve pressure history and cancel obsolete post-switch probes.
+- Show failed or overdue switches as `BLOCKED`, retaining the protection against
+  repeated launches when provider state or startup selection is uncertain.
+- Add offline tests for replacement sessions, delayed loads, stale state,
+  ignored models, configuration checks, and minimum warm time after adoption.
+
 ## 0.1.14 — 2026-09-16
 
 - Give recovery probes a 120-second timeout and 16-token output limit. Add

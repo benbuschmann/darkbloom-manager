@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.14"
+MANAGER_VERSION = "0.1.15"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -154,6 +154,7 @@ class LocalDaemonState:
     requests_served: int | None = None
     reconnect_count: int | None = None
     tokens_generated: int | None = None
+    advertised_models: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,8 @@ class Decision:
     challenger: str | None = None
     challenger_streak: int = 0
     warming: bool = False
+    blocked: bool = False
+    adopted: bool = False
 
 
 def log(message: str) -> None:
@@ -851,6 +854,10 @@ def read_daemon_state(path: Path, now: float | None = None) -> LocalDaemonState 
         requests_served=nonnegative_int(stats.get("requests_served")),
         reconnect_count=nonnegative_int(connectivity.get("reconnect_count")),
         tokens_generated=nonnegative_int(stats.get("tokens_generated")),
+        advertised_models=(tuple(payload["advertised_models"])
+                           if isinstance(payload.get("advertised_models"), list)
+                           and all(isinstance(model, str) for model in payload["advertised_models"])
+                           else None),
     )
 
 
@@ -958,6 +965,10 @@ def reconcile_pending_switch(
     daemon: LocalDaemonState | None,
     now: float,
     warmup_timeout: float,
+    *,
+    config_path: Path | None = None,
+    eligible: Iterable[str] = (),
+    check_every: float = 60,
 ) -> Decision | None:
     pending = manager_state.get("pending_switch")
     if not isinstance(pending, dict) or not pending.get("target"):
@@ -965,6 +976,45 @@ def reconcile_pending_switch(
     target = str(pending["target"])
     command_at = float(pending.get("command_at") or now)
     elapsed = max(0.0, now - command_at)
+
+    # A PID change alone is expected during our own launch. Require a later,
+    # healthy session AND matching explicit selection/preload evidence before
+    # treating a different warm model as a replacement of the old request.
+    if daemon and daemon.alive and daemon.fresh and daemon.started_at > command_at:
+        pending.setdefault("observed_process", {"pid": daemon.pid, "started_at": daemon.started_at})
+    replacement = daemon.warm_models[0] if daemon and len(daemon.warm_models) == 1 else None
+    superseded = (
+        elapsed >= warmup_timeout and daemon and daemon.alive and daemon.fresh
+        and daemon.started_at > command_at and daemon.started_at <= now
+        and replacement != target and replacement in eligible
+        and daemon.advertised_models == (replacement,)
+        and config_path is not None and configured_preload_matches(config_path, replacement)
+    )
+    if superseded:
+        identity = {"pid": daemon.pid, "started_at": daemon.started_at, "model": replacement}
+        observation = pending.get("replacement_observation")
+        if (isinstance(observation, dict)
+                and observation.get("identity") == identity
+                and now - float(observation.get("at", now)) >= check_every):
+            manager_state.pop("pending_switch", None)
+            manager_state.pop("switch_probe", None)
+            manager_state.pop("current_residency", None)
+            for prefix in ("live", "dry"):
+                manager_state.pop(f"{prefix}_challenger_model", None)
+                manager_state.pop(f"{prefix}_challenger_streak", None)
+            manager_state.update(active_target=replacement, last_switch_at=now)
+            return Decision(replacement,
+                            f"previous switch to {target} superseded by the confirmed {replacement} selection; "
+                            "normal checks resumed; starting minimum warm time (--min-warm-time)",
+                            adopted=True)
+        if not isinstance(observation, dict) or observation.get("identity") != identity:
+            pending["replacement_observation"] = {"identity": identity, "at": now}
+        return Decision(target,
+                        f"old switch to {target} is blocked; {replacement} is warm with matching startup selection; "
+                        "waiting for a second check before resuming normal selection",
+                        warming=True, blocked=True)
+    else:
+        pending.pop("replacement_observation", None)
 
     if warm_selection_matches(daemon, target):
         manager_state.pop("pending_switch", None)
@@ -982,6 +1032,7 @@ def reconcile_pending_switch(
             target,
             f"switch attempt failed: {pending['command_error']}; automatic restart is blocked",
             warming=True,
+            blocked=True,
         )
 
     if (
@@ -994,6 +1045,7 @@ def reconcile_pending_switch(
             target,
             f"model load failed: {daemon.load_error_message}; automatic restart is blocked",
             warming=True,
+            blocked=True,
         )
 
     if elapsed < warmup_timeout:
@@ -1010,7 +1062,31 @@ def reconcile_pending_switch(
         f"model loading exceeded {format_duration(warmup_timeout)} (--warmup-timeout); automatic restart is "
         "blocked; inspect `darkbloom status` and logs",
         warming=True,
+        blocked=True,
     )
+
+
+def configured_preload_matches(path: Path, model: str) -> bool:
+    """Recognize an explicit singleton preload without requiring a TOML dependency.
+
+    Unsupported syntax, duplicate keys, or unreadable configuration is unknown,
+    never permission to discard a pending launch.
+    """
+    try:
+        text = path.expanduser().read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    sections = re.findall(r"(?ms)^\s*\[backend\][ \t]*(?:#[^\n]*)?\n(.*?)(?=^\s*\[|\Z)", text)
+    if len(sections) != 1:
+        return False
+    section = sections[0]
+    if len(re.findall(r"(?m)^[ \t]*preload_models[ \t]*=", section)) != 1:
+        return False
+    quoted = re.escape(json.dumps(model, ensure_ascii=False))
+    if "'" not in model and "\n" not in model and "\\" not in model:
+        quoted += "|" + re.escape("'" + model + "'")
+    return re.search(r"(?m)^[ \t]*preload_models[ \t]*=[ \t]*\[\s*(?:" + quoted
+                     + r")\s*,?\s*\][ \t]*(?:#[^\n]*)?$", section) is not None
 
 
 def parse_json_output(text: str) -> Any:
@@ -1517,7 +1593,7 @@ def report_timeline(state: dict[str, Any], daemon: LocalDaemonState | None,
             current, decision, state, daemon, now, check_at, interval, confirmations, minimum)
         contender = decision.challenger or decision.target
         if not blocking and (decision.warming or state.get("pending_switch")):
-            text = "check pending model warm-up"
+            text = "check blocked switch and provider state" if decision.blocked else "check pending model warm-up"
         elif not blocking and decision.challenger and decision.target == current and decision.challenger_streak > 0:
             count = min(confirmations, decision.challenger_streak + 1)
             text = f"check {count} of {confirmations} for {contender}"
@@ -1657,6 +1733,8 @@ def print_report(
         action = "RECOVERY " + recovery["phase"].upper()
     elif not decision.target:
         action = "WAIT"
+    elif decision.blocked:
+        action = "BLOCKED"
     elif decision.warming:
         action = "WARMING"
     elif selection_ready:
@@ -2474,10 +2552,13 @@ class Manager:
             daemon,
             now,
             self.args.warmup_timeout,
+            config_path=self.args.config or DEFAULT_PROVIDER_CONFIG_PATH,
+            eligible=eligible_models,
+            check_every=self.args.check_every,
         ) if discovery_available else None
         if pending_decision is not None:
             decision = pending_decision
-            if not decision.warming and self.args.hourly_probes and self.args.apply:
+            if not decision.warming and not decision.adopted and self.args.hourly_probes and self.args.apply:
                 confirmed_at = time.time()
                 manager_state["switch_probe"] = {
                     "target": decision.target, "confirmed_at": confirmed_at,
@@ -2564,7 +2645,8 @@ class Manager:
         if decision.target is None:
             log("no switch: waiting for an eligible scored model")
         elif decision.warming:
-            log(f"warm-up pending: {decision.target}; no restart will be issued")
+            label = "switch blocked" if decision.blocked else "warm-up pending"
+            log(f"{label}: {decision.target}; no restart will be issued")
         elif selection_matches:
             log(f"no switch: desired model is already warm ({decision.target})")
         elif blocked:
@@ -2581,6 +2663,8 @@ class Manager:
                 "target": decision.target,
                 "warm_models": [decision.target],
                 "command_at": time.time(),
+                "previous_process": ({"pid": daemon.pid, "started_at": daemon.started_at}
+                                     if daemon else None),
             }
             write_json_atomic(self.state_path, manager_state)
             log("switching the launchd provider to " + decision.target)

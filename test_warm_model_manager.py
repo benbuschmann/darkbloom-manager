@@ -94,7 +94,7 @@ def timeline_lines(state, now, enabled=True, apply=True):
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.14")
+        self.assertEqual(MANAGER_VERSION, "0.1.15")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -788,6 +788,102 @@ class PendingSwitchTests(unittest.TestCase):
 
 
 IGNORED = "EigenLabs/Qwen3.8-27B-4bit-mtp"
+
+
+class SupersededSwitchTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.config = Path(directory.name) / "provider.toml"
+        self.config.write_text('[backend]\npreload_models = ["bonsai"]\nstartup_preload = true\n')
+        self.state = {"pending_switch": {"target": "gpt", "command_at": 1000},
+                      "pressure_history": {"gpt": [{"at": 1900, "pressure": 1}]},
+                      "switch_probe": {"target": "gpt"}, "live_challenger_streak": 3}
+        self.daemon = LocalDaemonState("bonsai", ("bonsai",), False, 20, 1800, True,
+                                       advertised_models=("bonsai",))
+
+    def check(self, now=2000, **kwargs):
+        return reconcile_pending_switch(self.state, self.daemon, now, 180,
+                                        config_path=self.config, eligible=kwargs.get("eligible", ["gpt", "bonsai"]))
+
+    def test_legacy_pending_adopts_replacement_after_two_checks(self):
+        self.assertTrue(self.check().blocked)
+        self.assertTrue(self.check(2059).blocked)
+        # The evidence is saved, including across a manager restart.
+        self.state = json.loads(json.dumps(self.state))
+        result = self.check(2060)
+        self.assertTrue(result.adopted)
+        self.assertEqual(result.target, "bonsai")
+        self.assertFalse(result.warming)
+        self.assertNotIn("pending_switch", self.state)
+        self.assertNotIn("switch_probe", self.state)
+        self.assertNotIn("live_challenger_streak", self.state)
+        self.assertEqual(self.state["last_switch_at"], 2060)
+        self.assertEqual(self.state["pressure_history"]["gpt"][0]["pressure"], 1)
+
+    def test_ambiguous_or_ineligible_replacement_stays_blocked(self):
+        original = self.daemon
+        for changes in ({"fresh": False}, {"alive": False}, {"started_at": 900},
+                        {"advertised_models": None}, {"advertised_models": ("gpt", "bonsai")},
+                        {"warm_models": ()}, {"warm_models": ("gpt", "bonsai")}):
+            with self.subTest(changes=changes):
+                self.daemon = replace(original, **changes)
+                self.check()
+                self.assertTrue(self.check(2060).blocked)
+                self.assertIn("pending_switch", self.state)
+        self.daemon = original
+        self.check(2100, eligible=["gpt"])
+        self.assertTrue(self.check(2160, eligible=["gpt"]).blocked)
+
+    def test_own_restart_with_old_model_still_warm_does_not_cancel_launch(self):
+        self.config.write_text('[backend]\npreload_models = ["gpt"]\n')
+        self.check()
+        self.assertTrue(self.check(2060).blocked)
+        self.daemon = replace(self.daemon, warm_models=("gpt",), advertised_models=("gpt",))
+        result = self.check(2120)
+        self.assertFalse(result.warming)
+        self.assertFalse(result.adopted)
+        self.assertEqual(result.target, "gpt")
+
+    def test_changed_or_stale_observation_requires_two_new_checks(self):
+        self.check()
+        self.daemon = replace(self.daemon, fresh=False)
+        self.check(2060)
+        self.daemon = replace(self.daemon, fresh=True)
+        self.assertTrue(self.check(2120).blocked)
+        self.daemon = replace(self.daemon, pid=21, started_at=2130)
+        self.assertTrue(self.check(2180).blocked)
+        self.assertTrue(self.check(2240).adopted)
+
+    def test_config_reader_fails_closed_and_accepts_singleton_toml(self):
+        for value in ('["bonsai"]', "['bonsai']", '[\n  "bonsai",\n] # selected'):
+            self.config.write_text('[backend]\npreload_models = ' + value + '\n[provider]\nname="fixture"\n')
+            self.assertTrue(manager_module.configured_preload_matches(self.config, "bonsai"))
+        for text in ('[backend]\npreload_models=["gpt"]\n',
+                     '[backend]\npreload_models=["bonsai", "gpt"]\n',
+                     '[backend]\npreload_models=["bonsai"]\npreload_models=["gpt"]\n',
+                     '[provider]\npreload_models=["bonsai"]\n'):
+            self.config.write_text(text)
+            self.assertFalse(manager_module.configured_preload_matches(self.config, "bonsai"))
+        self.config.unlink()
+        self.assertFalse(manager_module.configured_preload_matches(self.config, "bonsai"))
+
+    def test_daemon_reader_distinguishes_missing_selection_from_empty(self):
+        path = self.config.with_name("daemon.json")
+        for advertised, expected in ((["bonsai"], ("bonsai",)), ([], ()), (None, None), ([123], None)):
+            path.write_text(json.dumps({"pid": 20, "started_at": 1800, "written_at": 2000,
+                                        "warm_models": ["bonsai"], "advertised_models": advertised}))
+            with patch("warm_model_manager.process_alive", return_value=True):
+                daemon = manager_module.read_daemon_state(path, now=2000)
+            self.assertEqual(daemon.advertised_models, expected)
+
+    def test_preload_change_interrupts_replacement_confirmation(self):
+        self.check()
+        self.config.write_text('[backend]\npreload_models=["gpt"]\n')
+        self.assertTrue(self.check(2060).blocked)
+        self.config.write_text('[backend]\npreload_models=["bonsai"]\n')
+        self.assertTrue(self.check(2120).blocked)
+        self.assertTrue(self.check(2180).adopted)
 
 
 class SingleModelLoadingTests(unittest.TestCase):
@@ -3000,6 +3096,35 @@ class ManagerIntegrationTests(unittest.TestCase):
 
     def save(self, state):
         self.path.write_text(json.dumps(state))
+
+    def test_superseded_pending_resumes_without_restart_and_respects_warm_time(self):
+        self.args.config = self.path.with_name("provider.toml")
+        self.args.config.write_text('[backend]\npreload_models=["good"]\n')
+        self.args.mode = "run"
+        self.args.hourly_probes = True
+        self.local.return_value = {"good", "candidate"}
+        self.capacity.return_value = self.samples(good=1, candidate=100)
+        state, _ = self.tick()
+        state["pending_switch"] = {"target": "candidate", "warm_models": ["candidate"], "command_at": 9000}
+        state["switch_probe"] = {"target": "candidate", "due_at": 11000}
+        self.save(state)
+        self.daemon.return_value = replace(self.daemon.return_value, pid=456, started_at=9900,
+                                            advertised_models=("good",))
+        self.manager = Manager(self.args)
+        state, report = self.tick(10060)
+        self.assertIn("LIVE, BLOCKED", report)
+        self.assertIn("check blocked switch", report)
+        self.manager = Manager(self.args)
+        state, report = self.tick(10120)
+        self.assertNotIn("pending_switch", state)
+        self.assertNotIn("switch_probe", state)
+        self.assertIn("superseded", report)
+        self.assertIn("LIVE, KEEP", report)
+        self.assertEqual(state["current_residency"]["warm_since"], 10120)
+        for now in (10180, 10240, 10300):
+            state, report = self.tick(now)
+        self.assertIn("minimum warm time", report)
+        self.launch.assert_not_called()
 
     def test_columns_only_changes_presentation_not_selection_or_saved_state(self):
         self.local.return_value = {"good", "candidate"}
