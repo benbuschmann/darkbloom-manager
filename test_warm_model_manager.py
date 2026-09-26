@@ -94,7 +94,7 @@ def timeline_lines(state, now, enabled=True, apply=True):
 
 class CapacityTests(unittest.TestCase):
     def test_manager_release_version(self) -> None:
-        self.assertEqual(MANAGER_VERSION, "0.1.15")
+        self.assertEqual(MANAGER_VERSION, "0.1.16")
 
     def test_default_model_weights(self) -> None:
         self.assertEqual(DEFAULT_WEIGHTS["qwen3.5-35b-a3b"], 1.25)
@@ -884,6 +884,152 @@ class SupersededSwitchTests(unittest.TestCase):
         self.config.write_text('[backend]\npreload_models=["bonsai"]\n')
         self.assertTrue(self.check(2120).blocked)
         self.assertTrue(self.check(2180).adopted)
+
+
+class PurgeSwitchTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.config = Path(temp.name) / "provider.toml"
+        self.config.write_text('[backend]\npreload_models = ["old"]\n')
+        self.expected = LocalDaemonState("old", ("old",), False, 123, 100, True)
+        self.current = self.expected
+        self.cancelled = False
+        self.events = []
+        self.mock("read_daemon_state", side_effect=lambda *a, **k: self.current)
+        self.mock("provider_services", side_effect=lambda: {"io.darkbloom.provider": self.current.pid} if self.current else {})
+        self.mock("process_alive", side_effect=lambda pid: bool(self.current and self.current.pid == pid))
+        self.stop = self.mock("stop_provider", side_effect=self.stop_service)
+        self.run = self.mock("subprocess.run", side_effect=self.command)
+        self.mock("time.sleep", side_effect=AssertionError("unexpected wait"))
+
+    def mock(self, name, **kwargs):
+        p = patch("warm_model_manager." + name, **kwargs)
+        result = p.start()
+        self.addCleanup(p.stop)
+        return result
+
+    def stop_service(self, *args, **kwargs):
+        self.assertTrue(kwargs["before_stop"]())
+        self.events.append("stop")
+        self.current = None
+
+    def command(self, args, **kwargs):
+        self.assertTrue(kwargs["capture_output"])
+        if args == ["/usr/bin/sudo", "-n", "-l", "--", "/usr/sbin/purge"]:
+            self.events.append("permission")
+        elif args == ["/usr/bin/sudo", "-n", "--", "/usr/sbin/purge"]:
+            self.assertIsNone(self.current)
+            self.assertEqual(kwargs["timeout"], 30)
+            self.events.append("purge")
+        else:
+            self.assertEqual(args[:2], ["darkbloom", "start"])
+            self.assertIn('preload_models = ["new"]', self.config.read_text())
+            self.events.append("start")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def switch(self, **kwargs):
+        with redirect_stdout(io.StringIO()):
+            switch_model("darkbloom", "new", self.config, purge_before_switch=True,
+                         expected_daemon=kwargs.get("expected", self.expected),
+                         daemon_state_path=self.config.with_name("daemon.json"),
+                         cancelled=lambda: self.cancelled)
+
+    def test_stops_then_purges_then_synchronizes_and_starts(self):
+        self.switch()
+        self.assertEqual(self.events, ["permission", "stop", "purge", "start"])
+
+    def test_permission_failure_leaves_provider_and_config_untouched(self):
+        self.run.return_value = subprocess.CompletedProcess([], 1, "", "password required")
+        self.run.side_effect = None
+        with self.assertRaisesRegex(RuntimeError, "permission"):
+            self.switch()
+        self.stop.assert_not_called()
+        self.assertIn('["old"]', self.config.read_text())
+
+    def test_busy_stale_and_replaced_processes_are_not_stopped(self):
+        for changes in ({"inference_active": True}, {"fresh": False}, {"pid": 124}, {"started_at": 200}):
+            self.current = replace(self.expected, **changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(RuntimeError, "before shutdown"):
+                self.switch()
+        self.stop.assert_not_called()
+        self.assertNotIn("purge", self.events)
+
+    def test_unconfirmed_stop_does_not_purge_or_start(self):
+        self.stop.side_effect = None
+        with patch("warm_model_manager.time.monotonic", side_effect=[0, 31]):
+            with self.assertRaisesRegex(RuntimeError, "shutdown not confirmed"):
+                self.switch()
+        self.assertEqual(self.events, ["permission"])
+
+    def test_purge_failure_and_timeout_do_not_start(self):
+        for timed_out in (False, True):
+            self.current = self.expected
+            self.events = []
+            def run(args, **kwargs):
+                if "-l" not in args:
+                    if timed_out:
+                        raise subprocess.TimeoutExpired(args, 30)
+                    return subprocess.CompletedProcess(args, 1, "", "failed")
+                return self.command(args, **kwargs)
+            self.run.side_effect = run
+            with self.subTest(timeout=timed_out), self.assertRaises((RuntimeError, subprocess.TimeoutExpired)):
+                self.switch()
+            self.assertNotIn("start", self.events)
+            self.assertIsNone(self.current)
+            self.assertIn('["old"]', self.config.read_text())
+
+    def test_new_provider_during_purge_is_not_replaced(self):
+        def run(args, **kwargs):
+            result = self.command(args, **kwargs)
+            if self.events[-1] == "purge":
+                self.current = replace(self.expected, pid=456)
+            return result
+        self.run.side_effect = run
+        with self.assertRaisesRegex(RuntimeError, "appeared"):
+            self.switch()
+        self.assertNotIn("start", self.events)
+
+    def test_cancel_and_config_change_after_purge_prevent_start(self):
+        for change_config in (False, True):
+            self.current = self.expected
+            self.cancelled = False
+            self.events = []
+            def run(args, **kwargs):
+                result = self.command(args, **kwargs)
+                if self.events[-1] == "purge":
+                    if change_config:
+                        self.config.write_text('[backend]\npreload_models=["manual"]\n')
+                    else:
+                        self.cancelled = True
+                return result
+            self.run.side_effect = run
+            with self.subTest(config_change=change_config), self.assertRaises(RuntimeError):
+                self.switch()
+            self.assertNotIn("start", self.events)
+
+    def test_recovery_already_offline_does_not_stop_again(self):
+        self.current = None
+        self.switch(expected=None)
+        self.stop.assert_not_called()
+        self.assertEqual(self.events, ["permission", "purge", "start"])
+
+    def test_default_switch_does_not_run_sudo_or_stop(self):
+        switch_model("darkbloom", "new", self.config)
+        self.assertEqual(self.events, ["start"])
+        self.stop.assert_not_called()
+
+    def test_ignored_target_never_stops_or_purges(self):
+        with self.assertRaisesRegex(RuntimeError, "ignored"):
+            switch_model("darkbloom", "new", self.config, {"new"}, purge_before_switch=True,
+                         expected_daemon=self.expected)
+        self.assertEqual(self.events, [])
+
+    def test_stop_failure_never_purges_or_starts(self):
+        self.stop.side_effect = RuntimeError("stop refused")
+        with self.assertRaisesRegex(RuntimeError, "stop refused"):
+            self.switch()
+        self.assertEqual(self.events, ["permission"])
 
 
 class SingleModelLoadingTests(unittest.TestCase):
@@ -1729,6 +1875,26 @@ class ProbeTests(unittest.TestCase):
 
 
 class RoutingRecoveryTests(unittest.TestCase):
+    def test_purge_permission_denial_prevents_recovery_shutdown(self):
+        self.args.purge_before_switch = True
+        with patch("warm_model_manager.check_purge_permission", side_effect=RuntimeError("permission denied")):
+            recovery, _ = self.trigger()
+        self.stop.assert_not_called()
+        self.assertFalse(recovery["attempted"])
+        self.assertIn("purge permission check failed", recovery["reason"])
+
+    def test_recovery_passes_purge_option_only_after_offline_wait(self):
+        self.args.purge_before_switch = True
+        with patch("warm_model_manager.check_purge_permission") as permission:
+            self.stopped()
+        permission.assert_called_once()
+        self.launch.assert_not_called()
+        self.tick(12415)
+        self.launch.assert_called_once()
+        self.assertTrue(self.launch.call_args.kwargs["purge_before_switch"])
+        self.assertEqual(self.launch.call_args.kwargs["daemon_state_path"], self.args.daemon_state)
+        self.assertNotIn("expected_daemon", self.launch.call_args.kwargs)
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -3096,6 +3262,44 @@ class ManagerIntegrationTests(unittest.TestCase):
 
     def save(self, state):
         self.path.write_text(json.dumps(state))
+
+    def test_purge_flag_is_inert_in_dry_run_and_passes_identity_in_live_mode(self):
+        self.args.purge_before_switch = True
+        self.daemon.return_value = replace(self.daemon.return_value, current_model=None, warm_models=())
+        with patch("warm_model_manager.check_purge_permission") as permission:
+            self.args.apply = False
+            _, report = self.tick()
+            self.assertIn("would stop the provider, purge disk cache", report)
+            permission.assert_not_called()
+            self.launch.assert_not_called()
+            self.args.apply = True
+            self.tick(10060)
+            permission.assert_called_once()
+        self.assertTrue(self.launch.call_args.kwargs["purge_before_switch"])
+        self.assertEqual(self.launch.call_args.kwargs["expected_daemon"], self.daemon.return_value)
+
+    def test_purge_permission_denial_does_not_save_a_pending_launch(self):
+        state, _ = self.tick()
+        self.args.purge_before_switch = True
+        self.daemon.return_value = replace(self.daemon.return_value, current_model=None, warm_models=())
+        with patch("warm_model_manager.check_purge_permission", side_effect=RuntimeError("permission denied")):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                self.tick(10060)
+        self.assertNotIn("pending_switch", json.loads(self.path.read_text()))
+        self.launch.assert_not_called()
+
+    def test_purge_switch_failure_is_saved_and_not_replayed(self):
+        self.args.purge_before_switch = True
+        self.daemon.return_value = replace(self.daemon.return_value, current_model=None, warm_models=())
+        self.launch.side_effect = RuntimeError("purge failed")
+        with patch("warm_model_manager.check_purge_permission") as permission:
+            with self.assertRaisesRegex(RuntimeError, "purge failed"):
+                self.tick()
+            state, report = self.tick(10060)
+            permission.assert_called_once()
+        self.launch.assert_called_once()
+        self.assertEqual(state["pending_switch"]["command_error"], "purge failed")
+        self.assertIn("BLOCKED", report)
 
     def test_superseded_pending_resumes_without_restart_and_respects_warm_time(self):
         self.args.config = self.path.with_name("provider.toml")

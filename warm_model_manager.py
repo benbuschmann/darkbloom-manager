@@ -43,7 +43,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 
-MANAGER_VERSION = "0.1.15"
+MANAGER_VERSION = "0.1.16"
 # State formats change only when their stored data changes, independently of
 # the release number. A major release alone must not erase switching state.
 STATE_SCHEMA = 4
@@ -1342,15 +1342,81 @@ def local_endpoint_start_flags(path: Path, daemon: LocalDaemonState | None) -> l
     return flags
 
 
+def check_purge_permission() -> None:
+    """Ask sudo about this exact command without running it or prompting."""
+    result = subprocess.run(
+        ["/usr/bin/sudo", "-n", "-l", "--", "/usr/sbin/purge"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("purge permission unavailable; configure passwordless sudo for /usr/sbin/purge; provider not stopped")
+
+
+def purge_between_models(
+    darkbloom: str, daemon_path: Path, expected: LocalDaemonState | None,
+    cancelled: Callable[[], bool],
+) -> None:
+    """Stop only the observed idle service, then purge with no provider alive."""
+    check_purge_permission()
+
+    def idle_identity() -> bool:
+        current = read_daemon_state(daemon_path, now=time.time())
+        return bool(not cancelled() and expected and current and current.alive and current.fresh
+                    and current.pid == expected.pid and current.started_at == expected.started_at
+                    and current.warm_models == expected.warm_models and not current.inference_active)
+
+    def offline() -> bool:
+        current = read_daemon_state(daemon_path, now=time.time())
+        return not (provider_services() or (expected and process_alive(expected.pid))
+                    or (current and current.alive))
+
+    if cancelled():
+        raise RuntimeError("purge switch cancelled before shutdown")
+    if expected is not None:
+        if not idle_identity():
+            raise RuntimeError("provider changed, became busy, or is stale; purge switch cancelled before shutdown")
+        log("purge switch: stopping the idle provider once")
+        stop_provider(darkbloom, expected.pid, before_stop=idle_identity)
+        deadline = time.monotonic() + 30
+        while not offline():
+            if cancelled() or time.monotonic() >= deadline:
+                raise RuntimeError("provider shutdown not confirmed; purge and restart blocked")
+            time.sleep(0.5)
+    if cancelled() or not offline():
+        raise RuntimeError("provider is running or switch cancelled; purge and restart blocked")
+    log("purge switch: provider stopped; running sudo -n /usr/sbin/purge (30s timeout)")
+    result = subprocess.run(["/usr/bin/sudo", "-n", "--", "/usr/sbin/purge"],
+                            capture_output=True, text=True, timeout=30, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"purge failed (exit {result.returncode}); provider left stopped; automatic restart blocked")
+    if cancelled() or not offline():
+        raise RuntimeError("provider appeared or switch cancelled after purge; restart blocked")
+    log("purge switch: disk cache cleared; preparing selected model")
+
+
 def switch_model(
     darkbloom: str,
     model_id: str,
     config_path: Path | None,
     ignored_models: Iterable[str] = (),
     local_flags: list[str] | None = None,
+    *,
+    purge_before_switch: bool = False,
+    expected_daemon: LocalDaemonState | None = None,
+    daemon_state_path: Path = DEFAULT_DAEMON_STATE_PATH,
+    cancelled: Callable[[], bool] | None = None,
 ) -> None:
     if model_id in ignored_models:
         raise RuntimeError("refusing to load an ignored model")
+    if purge_before_switch:
+        # Validate the config before taking a working provider offline. Re-read
+        # after purge so an operator edit during shutdown cannot be overwritten.
+        path = config_path or DEFAULT_PROVIDER_CONFIG_PATH
+        original = path.read_text(encoding="utf-8")
+        render_preload_model_config(original, model_id)
+        purge_between_models(darkbloom, daemon_state_path, expected_daemon, cancelled or (lambda: False))
+        if path.read_text(encoding="utf-8") != original:
+            raise RuntimeError("provider config changed during purge; restart blocked")
     synchronize_preload_model(
         config_path or DEFAULT_PROVIDER_CONFIG_PATH,
         model_id,
@@ -1360,6 +1426,10 @@ def switch_model(
         command.extend(["--config", str(config_path)])
     command.extend(["--model", model_id, "--idle-timeout", "0"])
     command.extend(local_flags or [])
+    if purge_before_switch:
+        current = read_daemon_state(daemon_state_path, now=time.time())
+        if (cancelled and cancelled()) or provider_services() or (current and current.alive):
+            raise RuntimeError("provider appeared or switch cancelled before start; restart blocked")
     result = subprocess.run(
         command,
         capture_output=True,
@@ -2063,7 +2133,9 @@ class Manager:
                  f"previous model {recovery['previous_model']}; starting once, no launch retry")
             try:
                 switch_model(self.args.darkbloom, recovery["model"], self.args.config, self.ignored,
-                             local_flags=recovery["local_flags"])
+                             local_flags=recovery["local_flags"],
+                             **({"purge_before_switch": True, "daemon_state_path": self.args.daemon_state,
+                                 "cancelled": lambda: self.stop_requested} if self.args.purge_before_switch else {}))
             except Exception as error:
                 # The command may have succeeded before an interruption. Keep
                 # waiting for fresh warm state, but never issue it a second time.
@@ -2223,6 +2295,12 @@ class Manager:
         if changed or fresh.inference_active:
             defer_check((changed or "provider became busy") + " before shutdown")
             return
+        if self.args.purge_before_switch:
+            try:
+                check_purge_permission()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                defer_check("purge permission check failed: " + probe_debug_text(str(error), ""))
+                return
         recovery.update(attempted=True, phase="stopping", command_at=time.time(), config_digest=digest,
                         local_flags=local_endpoint_start_flags(self.args.local_endpoint_file, fresh))
         state.pop("switch_probe", None)
@@ -2653,10 +2731,14 @@ class Manager:
             log(f"switch deferred: {blocked}")
         elif not self.args.apply:
             log(f"dry run: would switch to {decision.target}")
+            if self.args.purge_before_switch:
+                log("dry run: would stop the provider, purge disk cache, then start the selected model; no commands issued")
         else:
             # Persist intent before any provider change. A timed-out command
             # can still have restarted Darkbloom, and must never be retried
             # automatically just because it did not return successfully.
+            if self.args.purge_before_switch:
+                check_purge_permission()
             manager_state.pop("switch_probe", None)
             self.next_probe_at = 0.0
             manager_state["pending_switch"] = {
@@ -2671,6 +2753,10 @@ class Manager:
             try:
                 endpoint_options = ({"local_flags": local_endpoint_start_flags(self.args.local_endpoint_file, daemon)}
                                     if self.args.hourly_probes or self.args.recover_routing else {})
+                if self.args.purge_before_switch:
+                    endpoint_options.update(purge_before_switch=True, expected_daemon=daemon,
+                                            daemon_state_path=self.args.daemon_state,
+                                            cancelled=lambda: self.stop_requested)
                 switch_model(self.args.darkbloom, decision.target, self.args.config, self.ignored,
                              **endpoint_options)
             except Exception as error:
@@ -2791,6 +2877,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("mode", choices=("once", "run", "set-prod-token", "reset-recovery"), nargs="?", default="once")
     parser.add_argument("--apply", action="store_true", help="enable model changes, opted-in probes and routing recovery; default is dry-run")
+    parser.add_argument("--purge-before-switch", action="store_true", help="stop and verify the provider, run sudo -n /usr/sbin/purge, then load the selected model; requires --apply and permission for purge without a password prompt")
     parser.add_argument("--hourly-probes", action="store_true", help="send local and production self-route prompts once each per hour, 30 minutes apart, plus one self-route prompt 3 minutes after switch warm-up; enables the local endpoint on model switches; requires --apply")
     parser.add_argument("--recover-routing", action="store_true", help="optional routing recovery: after 15m warm and 3 local successes/self-route model_not_loaded failures 5m apart, stop for 15m, then use fresh scores to start the highest eligible model once; requires run --apply, local endpoint and production token; reset-recovery clears an inactive attempt")
     parser.add_argument("--recovery-probe-timeout", type=positive_float, default=RECOVERY_PROBE_TIMEOUT,

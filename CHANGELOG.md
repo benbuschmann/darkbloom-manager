@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.16 — 2026-09-26
+
+- Add optional `--purge-before-switch`: check sudo permission, stop and confirm
+  the idle provider is gone, purge disk cache, then load the selected model.
+- Bound purge to 30 seconds and block launches after failures, cancellation,
+  config edits, or an unexpected provider start. Preserve pending-switch guards.
+- Apply the option to recovery starts after the full offline wait. Dry runs and
+  normal switches without the flag issue no purge commands.
+- Document the command-specific sudo rule, setup, failure handling, and cache
+  limitations. Add mocked lifecycle and integration tests.
+
 ## 0.1.15 — 2026-09-24
 
 - Reconcile old pending switches when a later provider session has a different

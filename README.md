@@ -8,7 +8,7 @@ Example with illustrative values, with hourly probes and routing recovery enable
 
 ```text
 ================================================================================================================
-Darkbloom warm model manager 0.1.15    2026-09-24 07:31:52 PDT
+Darkbloom warm model manager 0.1.16    2026-09-26 07:31:52 PDT
 
 now      nvidia-nemotron-3.5-lightning  warm 1 hour 10 minutes  serving a request    LIVE, KEEP
          session: 168 requests | 124,521 tokens
@@ -95,6 +95,79 @@ and local model list through Darkbloom, which may migrate an older provider conf
 Add `--config /path/to/provider.toml` if your provider uses a custom config.
 The catalog, local scan, and live launches all use that path. Use
 `--darkbloom /path/to/darkbloom` if the CLI is not on your `PATH`.
+
+## Purge disk cache between model switches
+
+`--purge-before-switch` adds macOS `sudo purge` between stopping the old provider
+and starting the selected model. It is off by default and runs only with `--apply`.
+
+`purge` flushes and empties the disk buffer cache. It does not free live model
+allocations or bypass Darkbloom's memory checks. Clearing cached weight files can
+make the next load slower. Use this option to test whether cache cleanup helps
+your machine; it is not a fix for a model that cannot fit in RAM.
+
+Set up permission once on each provider Mac. Find your account name:
+
+```bash
+whoami
+```
+
+Open the sudo policy editor:
+
+```bash
+sudo visudo
+```
+
+Add this line, replacing `customer` with the account that runs the manager:
+
+```sudoers
+customer ALL=(root) NOPASSWD: /usr/sbin/purge ""
+```
+
+The empty quotes restrict permission to `purge` with no arguments. This grants
+permission for that command only. Keep the manager running as your normal user;
+it never reads or saves an admin password.
+
+Check permission without running purge:
+
+```bash
+sudo -n -l -- /usr/sbin/purge
+```
+
+Run the manager:
+
+```bash
+python3 warm_model_manager.py run --apply --hide-ignored --purge-before-switch
+```
+
+For each selected switch, the manager checks sudo permission before shutdown,
+rechecks the provider's identity and idle state, and stops only the matching
+Darkbloom service. It waits up to 30 seconds after the stop command for the
+process and service to disappear, then runs:
+
+```bash
+sudo -n -- /usr/sbin/purge
+```
+
+Purge has a 30-second timeout. After success, the manager synchronizes the
+selected preload model, starts Darkbloom, and waits for confirmed warm-up.
+A dry run issues no sudo, stop, or start commands. Keeping the current model
+does not trigger purge.
+
+Missing permission leaves the provider running. A failed or uncertain shutdown,
+a purge error or timeout, a config edit, cancellation, or another provider
+appearing during the operation blocks the new launch. If shutdown already
+finished, the provider stays stopped for inspection; the saved pending attempt
+prevents repeated restarts. The logs identify the stage that failed. After fixing
+the problem, you can start the selected model manually and let the manager
+confirm it warm.
+
+With `--recover-routing`, permission is also checked before the recovery shutdown.
+Purge runs after the full 15-minute offline wait, just before the fresh selected
+model starts. It does not cause another stop or shorten the recovery wait.
+
+Remove `--purge-before-switch` to return to normal switching. To revoke the
+permission too, remove the added line using `sudo visudo`.
 
 ## Hourly probes
 
@@ -544,6 +617,7 @@ the required consecutive checks and minimum warm time.
 | `--switch-improvement-percent PERCENT` | 25 | Required percentage improvement after switch cost. Must be nonnegative. |
 | `--switch-cost` | 300 seconds | Estimated time lost while changing models. |
 | `--decision-horizon` | 3600 seconds | Period used to weigh that lost time. Must exceed switch cost. |
+| `--purge-before-switch` | Off | Stop the provider, purge disk cache with limited passwordless sudo, then start the selected model. Live mode only. |
 | `--warmup-timeout` | 180 seconds | Time to wait for the requested model to become warm before reporting loading as overdue. |
 | `--pricing-refresh` | 900 seconds | Time between price-cache refreshes. |
 
