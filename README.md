@@ -124,6 +124,17 @@ Add this line, replacing `customer` with the account that runs the manager:
 customer ALL=(root) NOPASSWD: /usr/sbin/purge ""
 ```
 
+If `visudo` opens in **vi/vim**, press `i` to enter insert mode before adding
+the line. To save and exit:
+
+1. Press `Esc`.
+2. Type `:wq`.
+3. Press `Enter`.
+
+To exit without saving, press `Esc`, type `:q!`, then press `Enter`.
+`visudo` checks the sudoers syntax before installing your changes. If it reports
+an error, return to the editor and fix it rather than forcing the save.
+
 The empty quotes restrict permission to `purge` with no arguments. This grants
 permission for that command only. Keep the manager running as your normal user;
 it never reads or saves an admin password.
